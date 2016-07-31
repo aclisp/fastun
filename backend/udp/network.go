@@ -122,7 +122,7 @@ func (n *network) initTun() error {
 	var tunName string
 	var err error
 
-	n.tun, tunName, err = ip.OpenTun("flannel%d")
+	n.tun, tunName, err = ip.OpenTun("ftun%d")
 	if err != nil {
 		return fmt.Errorf("failed to open TUN device: %v", err)
 	}
