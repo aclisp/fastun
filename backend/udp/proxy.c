@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <memory.h>
 #include <assert.h>
+#include <time.h>
 
 #include <errno.h>
 #include <poll.h>
@@ -16,6 +17,19 @@
 
 #define CMD_DEFINE
 #include "proxy.h"
+
+#include "ikcp.h"
+#include "shiftarray.h"
+
+/* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
+typedef struct tcp_pkt {
+	IUINT32 sendts;
+	size_t len;
+	struct iphdr  iph;
+	/* The IP options start here. */
+	/* Then the TCP header, and any TCP options. */
+	char   data[1];
+} __attribute__ ((aligned (4))) tcp_pkt;
 
 struct ip_net {
 	in_addr_t ip;
@@ -42,6 +56,11 @@ struct route_entry *routes;
 size_t routes_alloc;
 size_t routes_cnt;
 
+lrad_shift_entry qentry;
+char *queue;
+size_t qmax;
+size_t tcp_pkt_len;
+
 in_addr_t tun_addr;
 
 int log_enabled;
@@ -63,6 +82,14 @@ static void log_error(const char *fmt, ...) {
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
 	}
+}
+
+static void log_info(const char *fmt, ...) {
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stdout, fmt, ap);
+	va_end(ap);
 }
 
 /* fast version -- only works with mults of 4 bytes */
@@ -347,6 +374,47 @@ _active:
 	return 1;
 }
 
+static inline size_t queue_len() {
+	return LRAD_SHIFT_LENGTH(qentry.fr, qentry.to, qmax);
+}
+
+static inline int queue_is_full() {
+	return queue_len() == qmax;
+}
+
+static inline int queue_is_empty() {
+	return queue_len() == 0;
+}
+
+/* Assume queue is not full, otherwise pop_front before call me. */
+static void push_back_queue(IUINT32 sendts, char *pkt, size_t pktlen) {
+	IUINT32 index;
+	char *p;
+
+	assert(!queue_is_full());
+	index = lrad_shift_get_push_back_index(&qentry.fr, &qentry.to, qmax);
+	p = queue + index * tcp_pkt_len;
+	((tcp_pkt *) p)->sendts = sendts;
+	((tcp_pkt *) p)->len = pktlen;
+	memcpy( &(((tcp_pkt *) p)->iph), pkt, pktlen );
+}
+
+static IUINT32 pop_front_queue() {
+	IUINT32 index;
+
+	index = lrad_shift_get_pop_front_index(&qentry.fr, &qentry.to, qmax);
+	return index;
+}
+
+static IUINT32 current_time_millis() {
+	struct timespec spec;
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &spec) == -1) {
+		log_error("clock_gettime() failure, errno=%d\n", errno);
+		exit(1);
+	}
+	return (spec.tv_sec * 1000L + spec.tv_nsec / 1000000L) & 0xFFFFFFFF;
+}
+
 static void process_cmd(int ctl) {
 	struct command cmd;
 	struct ip_net ipn;
@@ -407,12 +475,22 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	exit_flag = 0;
 	tun_addr = tun_ip;
 	log_enabled = log_errors;
+	log_enabled = 1;
 
 	buf = (char *) malloc(tun_mtu);
 	if( !buf ) {
 		log_error("Failed to allocate %d byte buffer\n", tun_mtu);
 		exit(1);
 	}
+
+	qmax = 10000;
+	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
+	queue = (char *) malloc(tcp_pkt_len * qmax);
+	if( !queue ) {
+		log_error("Failed to allocate %d bytes queue\n", tcp_pkt_len * qmax);
+		exit(1);
+	}
+	log_info("Created queue, max_items=%d, item_size=%d\n", qmax, tcp_pkt_len);
 
 	fcntl(tun, F_SETFL, O_NONBLOCK);
 
@@ -446,6 +524,57 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			} while( activity );
 	}
 
+	/* TODO before free, cleanup items in the queue! */
+	free(queue);
 	free(buf);
 }
 
+int main(int argc, char *argv[]) {
+	size_t tun_mtu;
+
+	tun_mtu = 1472;
+	log_enabled = 1;
+	/* Init queue */
+	qmax = 10000;
+	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
+	queue = (char *) malloc(tcp_pkt_len * qmax);
+	if( !queue ) {
+		log_error("Failed to allocate %d bytes queue\n", tcp_pkt_len * qmax);
+		exit(1);
+	}
+	log_info("Created queue, max_items=%d, item_size=%d\n", qmax, tcp_pkt_len);
+	log_info("sizeof(tcp_pkt)=%d\n", sizeof(tcp_pkt));
+	log_info("sizeof(tcp_pkt->iph)=%d\n", sizeof(struct iphdr));
+	log_info("sizeof(IUINT32)=%d\n", sizeof(IUINT32));
+	log_info("sizeof(size_t)=%d\n", sizeof(size_t));
+	log_info("current_time_millis()=%lu\n", current_time_millis());
+	assert(queue_is_empty());
+	assert(!queue_is_full());
+
+	/* Test queue operations - push_back */
+	IUINT32 current = current_time_millis();
+	char pkt[1000];
+	pkt[20] = 'a';
+	push_back_queue(current+1, pkt, 101);
+	assert(queue_len() == 1);
+	pkt[20] = 'b';
+	push_back_queue(current+2, pkt, 102);
+	assert(queue_len() == 2);
+	char *p;
+	p = queue + 0 * tcp_pkt_len;
+	assert(((tcp_pkt *) p)->sendts == current+1);
+	assert(((tcp_pkt *) p)->len == 101);
+	assert(((tcp_pkt *) p)->data[0] == 'a');
+	p = queue + 1 * tcp_pkt_len;
+	assert(((tcp_pkt *) p)->sendts == current+2);
+	assert(((tcp_pkt *) p)->len == 102);
+	assert(((tcp_pkt *) p)->data[0] == 'b');
+
+	/* Test queue operations - pop_front */
+	assert(pop_front_queue() == 0);
+	assert(pop_front_queue() == 1);
+	assert(pop_front_queue() == LRAD_SHIFT_TOINFI);
+	assert(pop_front_queue() == LRAD_SHIFT_TOINFI);
+
+	return 0;
+}
