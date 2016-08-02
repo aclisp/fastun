@@ -121,7 +121,7 @@ static void send_net_unreachable(int tun, char *offender) {
 	size_t pktlen, nsent;
 
 	off_iph_len = off_iph->ihl * 4;
-	if( off_iph_len >= sizeof(struct iphdr) + MAX_IPOPTLEN ) {
+	if( ((size_t)off_iph_len) >= sizeof(struct iphdr) + MAX_IPOPTLEN ) {
 		log_error("not sending net unreachable: mulformed ip pkt: iph=%d\n", (int)off_iph_len);
 		return; /* ip pkt mulformed */
 	}
@@ -166,7 +166,7 @@ static void send_net_unreachable(int tun, char *offender) {
 	/* Kick it back */
 	nsent = write(tun, &pkt, pktlen);
 
-	if( nsent < 0 ) {
+	if( ((int)nsent) < 0 ) {
 		log_error("failed to send ICMP net unreachable: %s\n", strerror(errno));
 	} else if( nsent != pktlen ) {
 		log_error("failed to send ICMP net unreachable: only %d out of %d byte sent\n", (int)nsent, (int)pktlen);
@@ -219,7 +219,7 @@ static struct sockaddr_in *find_route(in_addr_t dst) {
 
 	for( i = 0; i < routes_cnt; i++ ) {
 		if( contains(routes[i].dst, dst) ) {
-			// packets for same dest tend to come in bursts. swap to front make it faster for subsequent ones
+			/* packets for same dest tend to come in bursts. swap to front make it faster for subsequent ones */
 			if( i != 0 ) {
 				struct route_entry tmp = routes[i];
 				routes[i] = routes[0];
@@ -246,7 +246,7 @@ static char *inaddr_str(in_addr_t a, char *buf, size_t len) {
 static ssize_t tun_recv_packet(int tun, char *buf, size_t buflen) {
 	ssize_t nread = read(tun, buf, buflen);
 
-	if( nread < sizeof(struct iphdr) ) {
+	if( nread < ((ssize_t)sizeof(struct iphdr)) ) {
 		if( nread < 0 ) {
 			if( errno != EAGAIN && errno != EWOULDBLOCK )
 				log_error("TUN recv failed: %s\n", strerror(errno));
@@ -262,7 +262,7 @@ static ssize_t tun_recv_packet(int tun, char *buf, size_t buflen) {
 static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen) {
 	ssize_t nread = recv(sock, buf, buflen, MSG_DONTWAIT);
 
-	if( nread < sizeof(struct iphdr) ) {
+	if( nread < ((ssize_t)sizeof(struct iphdr)) ) {
 		if( nread < 0 ) {
 			if( errno != EAGAIN && errno != EWOULDBLOCK )
 				log_error("UDP recv failed: %s\n", strerror(errno));
@@ -278,7 +278,7 @@ static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen) {
 static void sock_send_packet(int sock, char *pkt, size_t pktlen, struct sockaddr_in *dst) {
 	ssize_t nsent = sendto(sock, pkt, pktlen, 0, (struct sockaddr *)dst, sizeof(struct sockaddr_in));
 
-	if( nsent != pktlen ) {
+	if( nsent != ((ssize_t)pktlen) ) {
 		if( nsent < 0 ) {
 			log_error("UDP send to %s:%hu failed: %s\n",
 					inet_ntoa(dst->sin_addr), ntohs(dst->sin_port), strerror(errno));
@@ -294,7 +294,7 @@ static void tun_send_packet(int tun, char *pkt, size_t pktlen) {
 _retry:
 	nsent = write(tun, pkt, pktlen);
 
-	if( nsent != pktlen ) {
+	if( nsent != ((ssize_t)pktlen) ) {
 		if( nsent < 0 ) {
 			if( errno == EAGAIN || errno == EWOULDBLOCK)
 				goto _retry;
@@ -374,6 +374,18 @@ _active:
 	return 1;
 }
 
+static void init_queue(size_t tun_mtu) {
+	qmax = 10000;
+	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
+	queue = (char *) malloc(tcp_pkt_len * qmax);
+	if( !queue ) {
+		log_error("Failed to allocate %d bytes queue\n", tcp_pkt_len * qmax);
+		exit(1);
+	}
+	log_info("Created queue of %dMB, max_items=%d, item_size=%d\n",
+		tcp_pkt_len * qmax / 1024 / 1024, qmax, tcp_pkt_len);
+}
+
 static inline size_t queue_len() {
 	return LRAD_SHIFT_LENGTH(qentry.fr, qentry.to, qmax);
 }
@@ -409,7 +421,7 @@ static IUINT32 pop_front_queue() {
 static IUINT32 current_time_millis() {
 	struct timespec spec;
 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &spec) == -1) {
-		log_error("clock_gettime() failure, errno=%d\n", errno);
+		log_error("clock_gettime() failure: %s\n", strerror(errno));
 		exit(1);
 	}
 	return (spec.tv_sec * 1000L + spec.tv_nsec / 1000000L) & 0xFFFFFFFF;
@@ -483,14 +495,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		exit(1);
 	}
 
-	qmax = 10000;
-	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
-	queue = (char *) malloc(tcp_pkt_len * qmax);
-	if( !queue ) {
-		log_error("Failed to allocate %d bytes queue\n", tcp_pkt_len * qmax);
-		exit(1);
-	}
-	log_info("Created queue, max_items=%d, item_size=%d\n", qmax, tcp_pkt_len);
+	init_queue(tun_mtu);
 
 	fcntl(tun, F_SETFL, O_NONBLOCK);
 
@@ -529,20 +534,14 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	free(buf);
 }
 
+#if 1
 int main(int argc, char *argv[]) {
-	size_t tun_mtu;
-
-	tun_mtu = 1472;
+	(void)argc;
+	(void)argv;
+	size_t tun_mtu = 1448;
 	log_enabled = 1;
 	/* Init queue */
-	qmax = 10000;
-	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
-	queue = (char *) malloc(tcp_pkt_len * qmax);
-	if( !queue ) {
-		log_error("Failed to allocate %d bytes queue\n", tcp_pkt_len * qmax);
-		exit(1);
-	}
-	log_info("Created queue, max_items=%d, item_size=%d\n", qmax, tcp_pkt_len);
+	init_queue(tun_mtu);
 	log_info("sizeof(tcp_pkt)=%d\n", sizeof(tcp_pkt));
 	log_info("sizeof(tcp_pkt->iph)=%d\n", sizeof(struct iphdr));
 	log_info("sizeof(IUINT32)=%d\n", sizeof(IUINT32));
@@ -578,3 +577,5 @@ int main(int argc, char *argv[]) {
 
 	return 0;
 }
+// gcc -Winline -Wall -Wextra -Wpedantic -std=gnu99 proxy.c shiftarray.c
+#endif
