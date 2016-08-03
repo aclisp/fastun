@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	encapOverhead = 28 // 20 bytes IP hdr + 8 bytes UDP hdr
+	encapOverhead = 52 // 20 bytes IP hdr + 8 bytes UDP hdr + 24 bytes KCP hdr
 )
 
 type network struct {

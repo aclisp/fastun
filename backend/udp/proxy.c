@@ -20,6 +20,7 @@
 
 #include "ikcp.h"
 #include "shiftarray.h"
+#include "util.h"
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -78,6 +79,7 @@ static void log_error(const char *fmt, ...) {
 	va_list ap;
 
 	if( log_enabled ) {
+		fprintf(stderr, "* ");
 		va_start(ap, fmt);
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
@@ -87,9 +89,12 @@ static void log_error(const char *fmt, ...) {
 static void log_info(const char *fmt, ...) {
 	va_list ap;
 
-	va_start(ap, fmt);
-	vfprintf(stdout, fmt, ap);
-	va_end(ap);
+	if( log_enabled ) {
+		fprintf(stdout, "  ");
+		va_start(ap, fmt);
+		vfprintf(stdout, fmt, ap);
+		va_end(ap);
+	}
 }
 
 /* fast version -- only works with mults of 4 bytes */
@@ -175,10 +180,18 @@ static void send_net_unreachable(int tun, char *offender) {
 
 static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 	size_t i;
+	char buf1[20];
+	char buf2[20];
+	char buf3[20];
 
 	for( i = 0; i < routes_cnt; i++ ) {
 		if( dst.ip == routes[i].dst.ip && dst.mask == routes[i].dst.mask ) {
 			routes[i].next_hop = *next_hop;
+			log_info("Update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+				routes_cnt,
+				dst.ip, ip_ntoa(buf1, dst.ip),
+				dst.mask, ip_ntoa(buf2, dst.mask),
+				ip_ntoa(buf3, next_hop->sin_addr.s_addr));
 			return 0;
 		}
 	}
@@ -186,8 +199,10 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 	if( routes_alloc == routes_cnt ) {
 		int new_alloc = (routes_alloc ? 2*routes_alloc : 8);
 		struct route_entry *new_routes = (struct route_entry *) realloc(routes, new_alloc*sizeof(struct route_entry));
-		if( !new_routes )
+		if( !new_routes ) {
+			log_error("failed to realloc routes to size of %d\n", new_alloc);
 			return ENOMEM;
+		}
 
 		routes = new_routes;
 		routes_alloc = new_alloc;
@@ -197,20 +212,36 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 	routes[routes_cnt].next_hop = *next_hop;
 	routes_cnt++;
 
+	log_info("Add the no. %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+		routes_cnt-1,
+		dst.ip, ip_ntoa(buf1, dst.ip),
+		dst.mask, ip_ntoa(buf2, dst.mask),
+		ip_ntoa(buf3, next_hop->sin_addr.s_addr));
 	return 0;
 }
 
 static int del_route(struct ip_net dst) {
 	size_t i;
+	char buf1[20];
+	char buf2[20];
+	char buf3[20];
 
 	for( i = 0; i < routes_cnt; i++ ) {
 		if( dst.ip == routes[i].dst.ip && dst.mask == routes[i].dst.mask ) {
+			log_info("Delete one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+				routes_cnt,
+				dst.ip, ip_ntoa(buf1, dst.ip),
+				dst.mask, ip_ntoa(buf2, dst.mask),
+				ip_ntoa(buf3, routes[i].next_hop.sin_addr.s_addr));
 			routes[i] = routes[routes_cnt-1];
 			routes_cnt--;
 			return 0;
 		}
 	}
 
+	log_error("failed to delete not found routes: dst.ip=%8X %s dst.mask=%8X %s\n",
+		dst.ip, ip_ntoa(buf1, dst.ip),
+		dst.mask, ip_ntoa(buf2, dst.mask));
 	return ENOENT;
 }
 
@@ -424,7 +455,7 @@ static IUINT32 current_time_millis() {
 		log_error("clock_gettime() failure: %s\n", strerror(errno));
 		exit(1);
 	}
-	return (spec.tv_sec * 1000L + spec.tv_nsec / 1000000L) & 0xFFFFFFFF;
+	return (IUINT32)((((IINT64)spec.tv_sec)*1000 + spec.tv_nsec/1000000) & 0xFFFFFFFFUL);
 }
 
 static void process_cmd(int ctl) {
@@ -499,6 +530,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	fcntl(tun, F_SETFL, O_NONBLOCK);
 
+	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 	while( !exit_flag ) {
 		int nfds = poll(fds, PFD_CNT, -1), activity;
 		if( nfds < 0 ) {
@@ -534,24 +566,25 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	free(buf);
 }
 
-#if 1
+#if 0
 int main(int argc, char *argv[]) {
 	(void)argc;
 	(void)argv;
 	size_t tun_mtu = 1448;
 	log_enabled = 1;
+	IUINT32 current = current_time_millis();
+
 	/* Init queue */
 	init_queue(tun_mtu);
-	log_info("sizeof(tcp_pkt)=%d\n", sizeof(tcp_pkt));
+	log_error("sizeof(tcp_pkt)=%d\n", sizeof(tcp_pkt));
 	log_info("sizeof(tcp_pkt->iph)=%d\n", sizeof(struct iphdr));
 	log_info("sizeof(IUINT32)=%d\n", sizeof(IUINT32));
-	log_info("sizeof(size_t)=%d\n", sizeof(size_t));
-	log_info("current_time_millis()=%lu\n", current_time_millis());
+	log_error("sizeof(size_t)=%d\n", sizeof(size_t));
+	log_info("current_time_millis()=%d,%3d\n", current/1000, current%1000);
 	assert(queue_is_empty());
 	assert(!queue_is_full());
 
 	/* Test queue operations - push_back */
-	IUINT32 current = current_time_millis();
 	char pkt[1000];
 	pkt[20] = 'a';
 	push_back_queue(current+1, pkt, 101);
@@ -577,5 +610,5 @@ int main(int argc, char *argv[]) {
 
 	return 0;
 }
-// gcc -Winline -Wall -Wextra -Wpedantic -std=gnu99 proxy.c shiftarray.c
+// gcc -Winline -Wall -Wextra -Wpedantic -std=gnu99 proxy.c shiftarray.c util.c
 #endif
