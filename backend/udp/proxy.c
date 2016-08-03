@@ -383,7 +383,7 @@ static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 _active:
 	return 1;
 }
-
+#if 0
 static int udp_to_tun(int sock, int tun, char *buf, size_t buflen) {
 	struct iphdr *iph;
 
@@ -404,7 +404,7 @@ static int udp_to_tun(int sock, int tun, char *buf, size_t buflen) {
 _active:
 	return 1;
 }
-
+#endif
 static void init_queue(size_t tun_mtu) {
 	qmax = 10000;
 	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
@@ -491,6 +491,60 @@ static void process_cmd(int ctl) {
 	}
 }
 
+static int udp_to_queue(int sock, int tun, char *buf, size_t buflen, IUINT32 current) {
+	struct iphdr *iph;
+
+	ssize_t pktlen = sock_recv_packet(sock, buf, buflen);
+	if (pktlen < 0)
+		return 0;
+
+	iph = (struct iphdr *)buf;
+
+	if( !decrement_ttl(iph) ) {
+		/* TTL went to 0, discard.
+		 * TODO: send back ICMP Time Exceeded
+		 */
+		goto _active;
+	}
+
+	if (queue_is_full()) {
+		log_info("queue full!\n");
+
+		IUINT32 index = pop_front_queue();
+		char *p = queue + index * tcp_pkt_len;
+		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
+	}
+
+	push_back_queue(current + 100, buf, pktlen);
+_active:
+	return 1;
+}
+
+static inline int _itimediff(IUINT32 later, IUINT32 earlier)
+{
+	return ((IINT32)(later - earlier));
+}
+
+static void process_queue(int tun, IUINT32 current) {
+	/* iterate queue from front, send the overdue packets to tun.
+		other packets still hold in queue. */
+	char *p;
+	size_t qlen = queue_len(), n;
+	IUINT32 index = qentry.fr;
+	for (n = 0; n < qlen; ++n, LRAD_SHIFT_INCIDX(index, qmax)) {
+		p = queue + index * tcp_pkt_len;
+		if (_itimediff(((tcp_pkt *) p)->sendts, current) > 0)
+			break;
+	}
+	/* now we have n packets to send */
+	while (n) {
+		index = pop_front_queue();
+		p = queue + index * tcp_pkt_len;
+		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
+		--n;
+	}
+}
+
 enum PFD {
 	PFD_TUN = 0,
 	PFD_SOCK,
@@ -531,15 +585,32 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	fcntl(tun, F_SETFL, O_NONBLOCK);
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
+
+	int cost = 0;
+	int interval = 10, timeout;
+	IUINT32 now;
+
 	while( !exit_flag ) {
-		int nfds = poll(fds, PFD_CNT, -1), activity;
+		/* poll exactly every interval ms */
+		if (cost >= interval) {
+			log_info("cost %d ms!\n", cost);
+			cost = cost % interval;
+		}
+		timeout = interval - cost;
+
+		int nfds = poll(fds, PFD_CNT, timeout), activity;
+		now = current_time_millis();
 		if( nfds < 0 ) {
-			if( errno == EINTR )
+			if( errno == EINTR ) {
+				cost = 0;
 				continue;
+			}
 
 			log_error("Poll failed: %s\n", strerror(errno));
 			exit(1);
 		}
+
+		process_queue(tun, now);
 
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl);
@@ -548,7 +619,8 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			do {
 				activity = 0;
 				activity += tun_to_udp(tun, sock, buf, tun_mtu);
-				activity += udp_to_tun(sock, tun, buf, tun_mtu);
+				//activity += udp_to_tun(sock, tun, buf, tun_mtu);
+				activity += udp_to_queue(sock, tun, buf, tun_mtu, now);
 
 				/* As long as tun or udp is readable bypass poll().
 				 * We'll just occasionally get EAGAIN on an unreadable fd which
@@ -559,6 +631,8 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				 * used to place an upper bound on how long we may neglect ctl.
 				 */
 			} while( activity );
+
+		cost = _itimediff(current_time_millis(), now);
 	}
 
 	/* TODO before free, cleanup items in the queue! */
