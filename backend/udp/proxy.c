@@ -598,7 +598,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 		timeout = interval - cost;
 
-		int nfds = poll(fds, PFD_CNT, timeout), activity;
+		int nfds = poll(fds, PFD_CNT, timeout), activity, counter;
 		now = current_time_millis();
 		if( nfds < 0 ) {
 			if( errno == EINTR ) {
@@ -615,8 +615,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl);
 
-		if( fds[PFD_TUN].revents & POLLIN || fds[PFD_SOCK].revents & POLLIN )
+		if( fds[PFD_TUN].revents & POLLIN || fds[PFD_SOCK].revents & POLLIN ) {
+			counter = 0;
 			do {
+				++counter;
 				activity = 0;
 				activity += tun_to_udp(tun, sock, buf, tun_mtu);
 				//activity += udp_to_tun(sock, tun, buf, tun_mtu);
@@ -630,7 +632,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				 * This is at the expense of the ctl socket, a counter could be
 				 * used to place an upper bound on how long we may neglect ctl.
 				 */
+				if (counter == 100)  /* 50MB/s = 36207pkt/s = 362pkt/10ms */
+					break;
 			} while( activity );
+		}
 
 		cost = _itimediff(current_time_millis(), now);
 	}
