@@ -1,5 +1,6 @@
 package udp
 
+//#cgo LDFLAGS: -lrt
 //#include "proxy.h"
 import "C"
 
