@@ -1,5 +1,7 @@
 package udp
 
+//#cgo CFLAGS: -Winline -Wall -Wextra -std=gnu99 -pedantic-errors
+//#cgo LDFLAGS: -lrt
 //#include "proxy.h"
 import "C"
 
