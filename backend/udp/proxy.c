@@ -22,6 +22,8 @@
 #include "shiftarray.h"
 #include "util.h"
 
+#define IKCP_OVERHEAD 24
+
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
 	IUINT32 sendts;
@@ -37,9 +39,16 @@ struct ip_net {
 	in_addr_t mask;
 };
 
+struct route_context {
+	int sock;
+	struct sockaddr_in next_hop;
+};
+
 struct route_entry {
 	struct ip_net      dst;
 	struct sockaddr_in next_hop;
+	ikcpcb *kcp;
+	struct route_context *ctx;
 };
 
 typedef struct icmp_pkt {
@@ -63,6 +72,7 @@ size_t qmax;
 size_t tcp_pkt_len;
 
 in_addr_t tun_addr;
+size_t tun_mtu_;
 
 int log_enabled;
 int exit_flag;
@@ -73,6 +83,37 @@ static inline in_addr_t netmask(int prefix_len) {
 
 static inline int contains(struct ip_net net, in_addr_t ip) {
 	return net.ip == (ip & net.mask);
+}
+
+static inline int sockaddr_eq(struct sockaddr_in *l, struct sockaddr_in *r) {
+	return l->sin_family   == r->sin_family      &&
+		l->sin_addr.s_addr == r->sin_addr.s_addr &&
+		l->sin_port        == r->sin_port;
+}
+
+static inline IUINT32 conv_of(in_addr_t l, in_addr_t r) {
+	l = ntohl(l) & 0xFFFF;
+	r = ntohl(r) & 0xFFFF;
+	assert(l != r);
+	if (l < r)
+		return (l << 16) | r;
+	else
+		return (r << 16) | l;
+}
+
+/* decode 32 bits unsigned int (lsb) */
+static inline const char *ikcp_decode32u(const char *p, IUINT32 *l)
+{
+#if IWORDS_BIG_ENDIAN
+	*l = *(const unsigned char*)(p + 3);
+	*l = *(const unsigned char*)(p + 2) + (*l << 8);
+	*l = *(const unsigned char*)(p + 1) + (*l << 8);
+	*l = *(const unsigned char*)(p + 0) + (*l << 8);
+#else
+	*l = *(const IUINT32*)p;
+#endif
+	p += 4;
+	return p;
 }
 
 static void log_error(const char *fmt, ...) {
@@ -178,7 +219,22 @@ static void send_net_unreachable(int tun, char *offender) {
 	}
 }
 
-static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
+static void sock_send_packet(int sock, char *pkt, size_t pktlen, struct sockaddr_in *dst);
+
+static int udp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
+	(void)kcp;
+	struct route_context *ctx = (struct route_context *)user;
+	sock_send_packet(ctx->sock, (char *)buf, len, &ctx->next_hop);
+	return 0;
+}
+
+static void kcp_writelog(const char *log, ikcpcb *kcp, void *user) {
+	(void)user;
+	log_info("%8X: %s\n", kcp->conv, log);
+}
+
+static int set_route(struct ip_net dst, struct sockaddr_in *next_hop, int sock) {
+	int err;
 	size_t i;
 	char buf1[20];
 	char buf2[20];
@@ -186,12 +242,19 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 
 	for( i = 0; i < routes_cnt; i++ ) {
 		if( dst.ip == routes[i].dst.ip && dst.mask == routes[i].dst.mask ) {
+			if (!sockaddr_eq(&routes[i].next_hop, next_hop)) {
+				log_info("Next hop changed from %s -> %s, recreate kcp?\n",
+					ip_ntoa(buf1, routes[i].next_hop.sin_addr.s_addr),
+					ip_ntoa(buf2, next_hop->sin_addr.s_addr));
+			}
+			routes[i].ctx->next_hop = *next_hop;
 			routes[i].next_hop = *next_hop;
-			log_info("Update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+			log_info("Update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X\n",
 				routes_cnt,
 				dst.ip, ip_ntoa(buf1, dst.ip),
 				dst.mask, ip_ntoa(buf2, dst.mask),
-				ip_ntoa(buf3, next_hop->sin_addr.s_addr));
+				ip_ntoa(buf3, next_hop->sin_addr.s_addr),
+				routes[i].kcp->conv);
 			return 0;
 		}
 	}
@@ -208,15 +271,44 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop) {
 		routes_alloc = new_alloc;
 	}
 
+	struct route_context *ctx = (struct route_context *) malloc(sizeof(struct route_context));
+	if (!ctx) {
+		log_error("failed to alloc context for the no. %d routes\n", routes_cnt);
+		return ENOMEM;
+	}
+	ctx->sock = sock;
+	ctx->next_hop = *next_hop;
+	ikcpcb *kcp = ikcp_create(conv_of(tun_addr, dst.ip), ctx);
+	if (!kcp) {
+		log_error("failed to alloc kcp for the no. %d routes\n", routes_cnt);
+		return ENOMEM;
+	}
+	kcp->output = udp_output;
+	kcp->writelog = kcp_writelog;
+	kcp->logmask = 0xFFF;
+	if ((err = ikcp_setmtu(kcp, tun_mtu_ + IKCP_OVERHEAD)) < 0) {
+		log_error("failed to set kcp mtu to %d: error code is %d\n", tun_mtu_ + IKCP_OVERHEAD, err);
+		return ENOMEM;
+	}
+	if ((err = ikcp_nodelay(kcp, 1, 10, 2, 1)) < 0) {
+		log_error("failed to set kcp to fastest mode: error code is %d\n", err);
+	}
+	//kcp->rx_minrto = 10;
+	//kcp->fastresend = 1;
+	//TODO: set wndsize
+
+	routes[routes_cnt].ctx = ctx;
+	routes[routes_cnt].kcp = kcp;
 	routes[routes_cnt].dst = dst;
 	routes[routes_cnt].next_hop = *next_hop;
 	routes_cnt++;
 
-	log_info("Add the no. %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+	log_info("Add the no. %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X kmtu=%d kmss=%d\n",
 		routes_cnt-1,
 		dst.ip, ip_ntoa(buf1, dst.ip),
 		dst.mask, ip_ntoa(buf2, dst.mask),
-		ip_ntoa(buf3, next_hop->sin_addr.s_addr));
+		ip_ntoa(buf3, next_hop->sin_addr.s_addr),
+		kcp->conv, kcp->mtu, kcp->mss);
 	return 0;
 }
 
@@ -228,11 +320,14 @@ static int del_route(struct ip_net dst) {
 
 	for( i = 0; i < routes_cnt; i++ ) {
 		if( dst.ip == routes[i].dst.ip && dst.mask == routes[i].dst.mask ) {
-			log_info("Delete one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s\n",
+			log_info("Delete one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X\n",
 				routes_cnt,
 				dst.ip, ip_ntoa(buf1, dst.ip),
 				dst.mask, ip_ntoa(buf2, dst.mask),
-				ip_ntoa(buf3, routes[i].next_hop.sin_addr.s_addr));
+				ip_ntoa(buf3, routes[i].next_hop.sin_addr.s_addr),
+				routes[i].kcp->conv);
+			ikcp_release(routes[i].kcp);
+			free(routes[i].ctx);
 			routes[i] = routes[routes_cnt-1];
 			routes_cnt--;
 			return 0;
@@ -244,7 +339,7 @@ static int del_route(struct ip_net dst) {
 		dst.mask, ip_ntoa(buf2, dst.mask));
 	return ENOENT;
 }
-
+#if 0
 static struct sockaddr_in *find_route(in_addr_t dst) {
 	size_t i;
 
@@ -258,6 +353,37 @@ static struct sockaddr_in *find_route(in_addr_t dst) {
 			}
 
 			return &routes[0].next_hop;
+		}
+	}
+
+	return NULL;
+}
+#endif
+static ikcpcb *find_by_addr(in_addr_t dst) {
+	size_t i;
+
+	for( i = 0; i < routes_cnt; i++ ) {
+		if( contains(routes[i].dst, dst) ) {
+			/* packets for same dest tend to come in bursts. swap to front make it faster for subsequent ones */
+			if( i != 0 ) {
+				struct route_entry tmp = routes[i];
+				routes[i] = routes[0];
+				routes[0] = tmp;
+			}
+
+			return routes[0].kcp;
+		}
+	}
+
+	return NULL;
+}
+
+static ikcpcb *find_by_conv(IUINT32 conv) {
+	size_t i;
+
+	for (i = 0; i < routes_cnt; i++) {
+		if (routes[i].kcp->conv == conv) {
+			return routes[i].kcp;
 		}
 	}
 
@@ -356,6 +482,61 @@ inline static int decrement_ttl(struct iphdr *iph) {
 	return 1;
 }
 
+static int tun_to_kcp(int tun, char *buf, size_t buflen) {
+	int err;
+	struct iphdr *iph;
+	ikcpcb *kcp;
+
+	ssize_t pktlen = tun_recv_packet(tun, buf, buflen);
+	if( pktlen < 0 )
+		return 0;
+
+	iph = (struct iphdr *)buf;
+
+	kcp = find_by_addr((in_addr_t) iph->daddr);
+	if (!kcp) {
+		send_net_unreachable(tun, buf);
+		goto _active;
+	}
+
+	if( !decrement_ttl(iph) ) {
+		/* TTL went to 0, discard.
+		 * TODO: send back ICMP Time Exceeded
+		 */
+		goto _active;
+	}
+
+	if ((err = ikcp_send(kcp, buf, pktlen)) < 0) {
+		log_error("KCP send fail: error code is %d\n", err);
+	}
+_active:
+	return 1;
+}
+
+static int udp_to_kcp(int sock, char *buf, size_t buflen) {
+	int err;
+	IUINT32 conv;
+	ikcpcb *kcp;
+
+	ssize_t pktlen = sock_recv_packet(sock, buf, buflen);
+	if( pktlen < 0 )
+		return 0;
+
+	ikcp_decode32u(buf, &conv);
+
+	kcp = find_by_conv(conv);
+	if (!kcp) {
+		log_error("conv not found: got from udp conv=%8X\n", conv);
+		goto _active;
+	}
+
+	if ((err = ikcp_input(kcp, buf, pktlen)) < 0) {
+		log_error("KCP input fail: error code is %d\n", err);
+	}
+_active:
+	return 1;
+}
+#if 0
 static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 	struct iphdr *iph;
 	struct sockaddr_in *next_hop;
@@ -383,7 +564,7 @@ static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 _active:
 	return 1;
 }
-#if 1
+
 static int udp_to_tun(int sock, int tun, char *buf, size_t buflen) {
 	struct iphdr *iph;
 
@@ -458,7 +639,7 @@ static IUINT32 current_time_millis() {
 	return (IUINT32)((((IINT64)spec.tv_sec)*1000 + spec.tv_nsec/1000000) & 0xFFFFFFFFUL);
 }
 
-static void process_cmd(int ctl) {
+static void process_cmd(int ctl, int sock) {
 	struct command cmd;
 	struct ip_net ipn;
 	struct sockaddr_in sa = {
@@ -478,7 +659,7 @@ static void process_cmd(int ctl) {
 		sa.sin_addr.s_addr = cmd.next_hop_ip;
 		sa.sin_port = htons(cmd.next_hop_port);
 
-		set_route(ipn, &sa);
+		set_route(ipn, &sa, sock);
 
 	} else if( cmd.cmd == CMD_DEL_ROUTE ) {
 		ipn.mask = netmask(cmd.dest_net_len);
@@ -491,14 +672,15 @@ static void process_cmd(int ctl) {
 	}
 }
 
-static int udp_to_queue(int sock, int tun, char *buf, size_t buflen, IUINT32 current) {
+static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 	struct iphdr *iph;
 
-	ssize_t pktlen = sock_recv_packet(sock, buf, buflen);
-	if (pktlen < 0)
+	if( pktlen < ((int)sizeof(struct iphdr)) ) {
+		log_error("KCP recv packet too small: %d bytes\n", pktlen);
 		return 0;
+	}
 
-	iph = (struct iphdr *)buf;
+	iph = (struct iphdr *)pkt;
 
 	if( !decrement_ttl(iph) ) {
 		/* TTL went to 0, discard.
@@ -515,7 +697,7 @@ static int udp_to_queue(int sock, int tun, char *buf, size_t buflen, IUINT32 cur
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
 	}
 
-	push_back_queue(current + 100, buf, pktlen);
+	push_back_queue(current + 100, pkt, pktlen);
 _active:
 	return 1;
 }
@@ -547,6 +729,23 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 	}
 }
 
+static void process_kcp(int tun, IUINT32 current, char *buf, size_t buflen) {
+	size_t i;
+	int pktlen;
+
+	for( i = 0; i < routes_cnt; i++ ) {
+		ikcp_update(routes[i].kcp, current);
+	}
+
+	for( i = 0; i < routes_cnt; i++ ) {
+		while (1) {
+			pktlen = ikcp_recv(routes[i].kcp, buf, buflen);
+			if (pktlen < 0) break;
+			en_queue(tun, buf, pktlen, current);
+		}
+	}
+}
+
 enum PFD {
 	PFD_TUN = 0,
 	PFD_SOCK,
@@ -573,10 +772,11 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	exit_flag = 0;
 	tun_addr = tun_ip;
+	tun_mtu_ = tun_mtu;
 	log_enabled = log_errors;
 	log_enabled = 1;
 
-	buf = (char *) malloc(tun_mtu);
+	buf = (char *) malloc(tun_mtu + IKCP_OVERHEAD);
 	if( !buf ) {
 		log_error("Failed to allocate %d byte buffer\n", tun_mtu);
 		exit(1);
@@ -615,6 +815,8 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			exit(1);
 		}
 
+		process_kcp(tun, now, buf, tun_mtu);
+
 		process_queue(tun, now, &proc, &total);
 		if (proc > maxproc)
 			maxproc = proc;
@@ -622,7 +824,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			maxtotal = total;
 
 		if( fds[PFD_CTL].revents & POLLIN )
-			process_cmd(ctl);
+			process_cmd(ctl, sock);
 
 		if( fds[PFD_TUN].revents & POLLIN || fds[PFD_SOCK].revents & POLLIN ) {
 			counter = 0;
@@ -630,15 +832,15 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				int r;
 				++counter;
 				activity = 0;
-				r = tun_to_udp(tun, sock, buf, tun_mtu);
+				r = tun_to_kcp(tun, buf, tun_mtu);
 				activity += r;
 				if (r) ++tx;
-				//r = udp_to_tun(sock, tun, buf, tun_mtu);
-				//activity += r;
-				//if (r) ++rx;
-				r = udp_to_queue(sock, tun, buf, tun_mtu, now);
+				r = udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
 				activity += r;
 				if (r) ++rx;
+				//r = udp_to_queue(sock, tun, buf, tun_mtu, now);
+				//activity += r;
+				//if (r) ++rx;
 
 				/* As long as tun or udp is readable bypass poll().
 				 * We'll just occasionally get EAGAIN on an unreadable fd which
