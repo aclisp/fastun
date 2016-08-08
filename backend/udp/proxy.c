@@ -236,9 +236,48 @@ static void kcp_writelog(const char *log, ikcpcb *kcp, void *user) {
 	log_info("%8X: %s\n", kcp->conv, log);
 }
 
+static int kcp_alloc(struct ip_net dst, struct sockaddr_in *next_hop, int sock,
+					struct route_context **pctx, ikcpcb **pkcp) {
+	int err;
+
+	struct route_context *ctx = (struct route_context *) malloc(sizeof(struct route_context));
+	if (!ctx) {
+		log_error("failed to alloc context for the no. %d routes\n", routes_cnt);
+		return ENOMEM;
+	}
+	ctx->sock = sock;
+	ctx->next_hop = *next_hop;
+	ikcpcb *kcp = ikcp_create(conv_of(tun_addr, dst.ip), ctx);
+	if (!kcp) {
+		log_error("failed to alloc kcp for the no. %d routes\n", routes_cnt);
+		return ENOMEM;
+	}
+	kcp->output = udp_output;
+	kcp->writelog = kcp_writelog;
+	//kcp->logmask = 0xFFF;
+	if ((err = ikcp_setmtu(kcp, tun_mtu_ + IKCP_OVERHEAD)) < 0) {
+		log_error("failed to set kcp mtu to %d: error code is %d\n", tun_mtu_ + IKCP_OVERHEAD, err);
+		return ENOMEM;
+	}
+	if ((err = ikcp_nodelay(kcp, 1, 10, 2, 1)) < 0) {
+		log_error("failed to set kcp to fastest mode: error code is %d\n", err);
+	}
+	if ((err = ikcp_wndsize(kcp, 10000, 10000)) < 0) {
+		log_error("failed to set kcp window size: error code is %d\n", err);
+	}
+	//kcp->rx_minrto = 10;
+	//kcp->fastresend = 1;
+
+	*pctx = ctx;
+	*pkcp = kcp;
+	return 0;
+}
+
 static int set_route(struct ip_net dst, struct sockaddr_in *next_hop, int sock) {
 	int err;
 	size_t i;
+	struct route_context *ctx;
+	ikcpcb *kcp;
 	char buf1[20];
 	char buf2[20];
 	char buf3[20];
@@ -250,14 +289,28 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop, int sock) 
 					ip_ntoa(buf1, routes[i].next_hop.sin_addr.s_addr),
 					ip_ntoa(buf2, next_hop->sin_addr.s_addr));
 			}
-			routes[i].ctx->next_hop = *next_hop;
+			/* Must recreate kcp any way! */
+			if ((err = kcp_alloc(dst, next_hop, sock, &ctx, &kcp)) != 0) {
+				log_error("Unable to update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X\n",
+					routes_cnt,
+					dst.ip, ip_ntoa(buf1, dst.ip),
+					dst.mask, ip_ntoa(buf2, dst.mask),
+					ip_ntoa(buf3, next_hop->sin_addr.s_addr),
+					routes[i].kcp->conv);
+				return err;
+			}
+			ikcp_release(routes[i].kcp);
+			free(routes[i].ctx);
+
+			routes[i].ctx = ctx;
+			routes[i].kcp = kcp;
 			routes[i].next_hop = *next_hop;
-			log_info("Update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X\n",
+			log_info("Update one of %d routes: dst.ip=%8X %s dst.mask=%8X %s next_hop=%s conv=%8X kmtu=%d kmss=%d\n",
 				routes_cnt,
 				dst.ip, ip_ntoa(buf1, dst.ip),
 				dst.mask, ip_ntoa(buf2, dst.mask),
 				ip_ntoa(buf3, next_hop->sin_addr.s_addr),
-				routes[i].kcp->conv);
+				kcp->conv, kcp->mtu, kcp->mss);
 			return 0;
 		}
 	}
@@ -274,31 +327,9 @@ static int set_route(struct ip_net dst, struct sockaddr_in *next_hop, int sock) 
 		routes_alloc = new_alloc;
 	}
 
-	struct route_context *ctx = (struct route_context *) malloc(sizeof(struct route_context));
-	if (!ctx) {
-		log_error("failed to alloc context for the no. %d routes\n", routes_cnt);
-		return ENOMEM;
+	if ((err = kcp_alloc(dst, next_hop, sock, &ctx, &kcp)) != 0) {
+		return err;
 	}
-	ctx->sock = sock;
-	ctx->next_hop = *next_hop;
-	ikcpcb *kcp = ikcp_create(conv_of(tun_addr, dst.ip), ctx);
-	if (!kcp) {
-		log_error("failed to alloc kcp for the no. %d routes\n", routes_cnt);
-		return ENOMEM;
-	}
-	kcp->output = udp_output;
-	kcp->writelog = kcp_writelog;
-	kcp->logmask = 0xFFF;
-	if ((err = ikcp_setmtu(kcp, tun_mtu_ + IKCP_OVERHEAD)) < 0) {
-		log_error("failed to set kcp mtu to %d: error code is %d\n", tun_mtu_ + IKCP_OVERHEAD, err);
-		return ENOMEM;
-	}
-	if ((err = ikcp_nodelay(kcp, 1, 10, 2, 1)) < 0) {
-		log_error("failed to set kcp to fastest mode: error code is %d\n", err);
-	}
-	//kcp->rx_minrto = 10;
-	//kcp->fastresend = 1;
-	//TODO: set wndsize
 
 	routes[routes_cnt].ctx = ctx;
 	routes[routes_cnt].kcp = kcp;
@@ -701,7 +732,7 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 		++tun_tx_pkt;
 	}
 
-	push_back_queue(current + 100, pkt, pktlen);
+	push_back_queue(current + 50, pkt, pktlen);
 _active:
 	return 1;
 }
