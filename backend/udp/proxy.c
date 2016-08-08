@@ -73,6 +73,8 @@ size_t tcp_pkt_len;
 
 in_addr_t tun_addr;
 size_t tun_mtu_;
+IUINT64 tun_rx_pkt, tun_tx_pkt;
+IUINT64 udp_rx_pkt, udp_tx_pkt;
 
 int log_enabled;
 int exit_flag;
@@ -225,6 +227,7 @@ static int udp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
 	(void)kcp;
 	struct route_context *ctx = (struct route_context *)user;
 	sock_send_packet(ctx->sock, (char *)buf, len, &ctx->next_hop);
+	++udp_tx_pkt;
 	return 0;
 }
 
@@ -695,6 +698,7 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 		IUINT32 index = pop_front_queue();
 		char *p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
+		++tun_tx_pkt;
 	}
 
 	push_back_queue(current + 100, pkt, pktlen);
@@ -725,6 +729,7 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 		index = pop_front_queue();
 		p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
+		++tun_tx_pkt;
 		--n;
 	}
 }
@@ -788,7 +793,6 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
-	IUINT32 tx = 0, rx = 0;
 	int cost = 0, maxcost = 0;
 	int proc = 0, maxproc = 0;
 	int total = 0, maxtotal = 0;
@@ -834,10 +838,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				activity = 0;
 				r = tun_to_kcp(tun, buf, tun_mtu);
 				activity += r;
-				if (r) ++tx;
+				if (r) ++tun_rx_pkt;
 				r = udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
 				activity += r;
-				if (r) ++rx;
+				if (r) ++udp_rx_pkt;
 				//r = udp_to_queue(sock, tun, buf, tun_mtu, now);
 				//activity += r;
 				//if (r) ++rx;
@@ -863,7 +867,8 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	/* TODO before free, cleanup items in the queue! */
 	free(queue);
 	free(buf);
-	log_info("maxcost=%d, tx=%u, rx=%u, maxproc=%d, maxtotal=%d\n", maxcost, tx, rx, maxproc, maxtotal);
+	log_info("maxcost=%d, maxproc=%d, maxtotal=%d\n", maxcost, maxproc, maxtotal);
+	log_info("tun rx=%llu, tx=%llu; udp rx=%llu, tx=%llu\n", tun_rx_pkt, tun_tx_pkt, udp_rx_pkt, udp_tx_pkt);
 }
 
 #if 0
