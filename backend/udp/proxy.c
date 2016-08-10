@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <linux/ip.h>
@@ -23,6 +24,11 @@
 #include "util.h"
 
 #define IKCP_OVERHEAD 24
+#define IKCP_SNDWND 10000
+#define IKCP_RCVWND 10000
+#define DELAY_QUESIZ 10000
+#define DELAY_MILLIS 30
+#define CHECKPOINT_INTERVAL 30000
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -62,6 +68,27 @@ typedef struct icmp_pkt {
 /* we calc hdr checksums using 32bit uints that can alias other types */
 typedef uint32_t __attribute__((__may_alias__)) aliasing_uint32_t;
 
+/* statistics */
+struct high_watermark {
+	int processing_cost;  /* If this too high, it could be I/O block */
+	int queueing_batch_tun_send;  /* This one should be smaller than max total */
+	int queueing_max_total;  /* If this too high, increase DELAY_QUESIZ */
+};
+
+struct accumulation {
+	IUINT64 tun_rx_pkt;
+	IUINT64 tun_tx_pkt;
+	IUINT64 udp_rx_pkt;
+	IUINT64 udp_tx_pkt;
+};
+
+typedef struct statistics {
+	struct high_watermark mark;
+	struct accumulation accu;
+} statistics;
+
+statistics last, curr;
+
 struct route_entry *routes;
 size_t routes_alloc;
 size_t routes_cnt;
@@ -73,8 +100,6 @@ size_t tcp_pkt_len;
 
 in_addr_t tun_addr;
 size_t tun_mtu_;
-IUINT64 tun_rx_pkt, tun_tx_pkt;
-IUINT64 udp_rx_pkt, udp_tx_pkt;
 
 int log_enabled;
 int exit_flag;
@@ -108,6 +133,8 @@ static inline const char *ikcp_decode32u(const char *p, IUINT32 *l)
 {
 #if IWORDS_BIG_ENDIAN
 	*l = *(const unsigned char*)(p + 3);
+g_info
+
 	*l = *(const unsigned char*)(p + 2) + (*l << 8);
 	*l = *(const unsigned char*)(p + 1) + (*l << 8);
 	*l = *(const unsigned char*)(p + 0) + (*l << 8);
@@ -118,11 +145,24 @@ static inline const char *ikcp_decode32u(const char *p, IUINT32 *l)
 	return p;
 }
 
+static char *timestamp(char *buffer) {
+	struct timeval tv;
+	struct tm local;
+	gettimeofday(&tv, NULL);
+	localtime_r(&tv.tv_sec, &local);
+	sprintf(buffer, "%04d/%02d/%02d %02d:%02d:%02d,%03d",
+			local.tm_year+1900, local.tm_mon+1, local.tm_mday,
+			local.tm_hour, local.tm_min, local.tm_sec,
+			(int)tv.tv_usec/1000);
+	return buffer;
+}
+
 static void log_error(const char *fmt, ...) {
+	char buf[24];
 	va_list ap;
 
 	if( log_enabled ) {
-		fprintf(stderr, "* ");
+		fprintf(stderr, "* %s ", timestamp(buf));
 		va_start(ap, fmt);
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
@@ -130,10 +170,11 @@ static void log_error(const char *fmt, ...) {
 }
 
 static void log_info(const char *fmt, ...) {
+	char buf[24];
 	va_list ap;
 
 	if( log_enabled ) {
-		fprintf(stdout, "  ");
+		fprintf(stdout, "  %s ", timestamp(buf));
 		va_start(ap, fmt);
 		vfprintf(stdout, fmt, ap);
 		va_end(ap);
@@ -160,6 +201,18 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 		t1++;
 
 	return ~t1;
+}
+
+static void print_stat() {
+	log_info("high_watermark: processing_cost=%d(%d) queueing_batch_tun_send=%d(%d) queueing_max_total=%d(%d)\n",
+		curr.mark.processing_cost, curr.mark.processing_cost - last.mark.processing_cost,
+		curr.mark.queueing_batch_tun_send, curr.mark.queueing_batch_tun_send - last.mark.queueing_batch_tun_send,
+		curr.mark.queueing_max_total, curr.mark.queueing_max_total - last.mark.queueing_max_total);
+	log_info("accumulation: tun rx=%llu(%llu), tx=%llu(%llu); udp rx=%llu(%llu), tx=%llu(%llu)\n",
+		curr.accu.tun_rx_pkt, curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt,
+		curr.accu.tun_tx_pkt, curr.accu.tun_tx_pkt - last.accu.tun_tx_pkt,
+		curr.accu.udp_rx_pkt, curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt,
+		curr.accu.udp_tx_pkt, curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt);
 }
 
 static void send_net_unreachable(int tun, char *offender) {
@@ -227,7 +280,7 @@ static int udp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
 	(void)kcp;
 	struct route_context *ctx = (struct route_context *)user;
 	sock_send_packet(ctx->sock, (char *)buf, len, &ctx->next_hop);
-	++udp_tx_pkt;
+	++curr.accu.udp_tx_pkt;
 	return 0;
 }
 
@@ -262,7 +315,7 @@ static int kcp_alloc(struct ip_net dst, struct sockaddr_in *next_hop, int sock,
 	if ((err = ikcp_nodelay(kcp, 1, 10, 2, 1)) < 0) {
 		log_error("failed to set kcp to fastest mode: error code is %d\n", err);
 	}
-	if ((err = ikcp_wndsize(kcp, 10000, 10000)) < 0) {
+	if ((err = ikcp_wndsize(kcp, IKCP_SNDWND, IKCP_RCVWND)) < 0) {
 		log_error("failed to set kcp window size: error code is %d\n", err);
 	}
 	//kcp->rx_minrto = 10;
@@ -529,6 +582,10 @@ static int tun_to_kcp(int tun, char *buf, size_t buflen) {
 
 	kcp = find_by_addr((in_addr_t) iph->daddr);
 	if (!kcp) {
+		char saddr[32], daddr[32];
+		log_error("KCP not found for IP fragment %s -> %s, kick back net unreachable\n",
+				inaddr_str(iph->saddr, saddr, sizeof(saddr)),
+				inaddr_str(iph->daddr, daddr, sizeof(daddr)));
 		send_net_unreachable(tun, buf);
 		goto _active;
 	}
@@ -560,7 +617,7 @@ static int udp_to_kcp(int sock, char *buf, size_t buflen) {
 
 	kcp = find_by_conv(conv);
 	if (!kcp) {
-		log_error("conv not found: got from udp conv=%8X\n", conv);
+		log_error("KCP conv not found: got from udp conv=%8X\n", conv);
 		goto _active;
 	}
 
@@ -621,7 +678,7 @@ _active:
 }
 #endif
 static void init_queue(size_t tun_mtu) {
-	qmax = 10000;
+	qmax = DELAY_QUESIZ;
 	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
 	queue = (char *) malloc(tcp_pkt_len * qmax);
 	if( !queue ) {
@@ -729,10 +786,10 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 		IUINT32 index = pop_front_queue();
 		char *p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
-		++tun_tx_pkt;
+		++curr.accu.tun_tx_pkt;
 	}
 
-	push_back_queue(current + 50, pkt, pktlen);
+	push_back_queue(current + DELAY_MILLIS, pkt, pktlen);
 _active:
 	return 1;
 }
@@ -760,7 +817,7 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 		index = pop_front_queue();
 		p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
-		++tun_tx_pkt;
+		++curr.accu.tun_tx_pkt;
 		--n;
 	}
 }
@@ -824,11 +881,11 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
-	int cost = 0, maxcost = 0;
-	int proc = 0, maxproc = 0;
-	int total = 0, maxtotal = 0;
+	int cost = 0;
+	int proc = 0;
+	int total = 0;
 	int interval = 10, timeout;
-	IUINT32 now;
+	IUINT32 now, checkpoint = 0;
 
 	while( !exit_flag ) {
 		/* poll exactly every interval ms */
@@ -853,10 +910,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		process_kcp(tun, now, buf, tun_mtu);
 
 		process_queue(tun, now, &proc, &total);
-		if (proc > maxproc)
-			maxproc = proc;
-		if (total > maxtotal)
-			maxtotal = total;
+		if (proc > curr.mark.queueing_batch_tun_send)
+			curr.mark.queueing_batch_tun_send = proc;
+		if (total > curr.mark.queueing_max_total)
+			curr.mark.queueing_max_total = total;
 
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl, sock);
@@ -869,10 +926,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				activity = 0;
 				r = tun_to_kcp(tun, buf, tun_mtu);
 				activity += r;
-				if (r) ++tun_rx_pkt;
+				if (r) ++curr.accu.tun_rx_pkt;
 				r = udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
 				activity += r;
-				if (r) ++udp_rx_pkt;
+				if (r) ++curr.accu.udp_rx_pkt;
 				//r = udp_to_queue(sock, tun, buf, tun_mtu, now);
 				//activity += r;
 				//if (r) ++rx;
@@ -891,15 +948,18 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 
 		cost = _itimediff(current_time_millis(), now);
-		if (cost > maxcost)
-			maxcost = cost;
+		if (cost > curr.mark.processing_cost)
+			curr.mark.processing_cost = cost;
+		if (checkpoint == 0 || _itimediff(now, checkpoint) >= CHECKPOINT_INTERVAL) {
+			print_stat();
+			last = curr;
+			checkpoint = now;
+		}
 	}
 
 	/* TODO before free, cleanup items in the queue! */
 	free(queue);
 	free(buf);
-	log_info("maxcost=%d, maxproc=%d, maxtotal=%d\n", maxcost, maxproc, maxtotal);
-	log_info("tun rx=%llu, tx=%llu; udp rx=%llu, tx=%llu\n", tun_rx_pkt, tun_tx_pkt, udp_rx_pkt, udp_tx_pkt);
 }
 
 #if 0
