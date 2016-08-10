@@ -28,7 +28,7 @@
 #define IKCP_RCVWND 10000
 #define DELAY_QUESIZ 10000
 #define DELAY_MILLIS 30
-#define CHECKPOINT_INTERVAL 30000
+#define CHECKPOINT_INTERVAL 10000
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -204,6 +204,8 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 }
 
 static void print_stat() {
+	char buf[24];
+
 	if (((IINT64)(curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt)) == 0)
 		return;
 
@@ -220,6 +222,7 @@ static void print_stat() {
 	printf("    udp rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.udp_rx_pkt, (IINT64)(curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt),
 		curr.accu.udp_tx_pkt, (IINT64)(curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt));
+	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CHECKPOINT_INTERVAL/1000);
 }
 
 static void send_net_unreachable(int tun, char *offender) {
