@@ -80,6 +80,11 @@ struct accumulation {
 	IUINT64 tun_tx_pkt;
 	IUINT64 udp_rx_pkt;
 	IUINT64 udp_tx_pkt;
+
+	IUINT64 tun_rx_byte;
+	IUINT64 tun_tx_byte;
+	IUINT64 udp_rx_byte;
+	IUINT64 udp_tx_byte;
 };
 
 typedef struct statistics {
@@ -216,12 +221,18 @@ static void print_stat() {
 		curr.mark.queueing_batch_tun_send, curr.mark.queueing_batch_tun_send - last.mark.queueing_batch_tun_send,
 		curr.mark.queueing_max_total, curr.mark.queueing_max_total - last.mark.queueing_max_total);
 	printf("ACCUMULATIONS\n");
-	printf("    tun rx=%llu (%lld), tx=%llu (%lld)\n",
+	printf("    tun pkets rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.tun_rx_pkt, (IINT64)(curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt),
 		curr.accu.tun_tx_pkt, (IINT64)(curr.accu.tun_tx_pkt - last.accu.tun_tx_pkt));
-	printf("    udp rx=%llu (%lld), tx=%llu (%lld)\n",
+	printf("    udp pkets rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.udp_rx_pkt, (IINT64)(curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt),
 		curr.accu.udp_tx_pkt, (IINT64)(curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt));
+	printf("    tun bytes rx=%llu (%lld), tx=%llu (%lld)\n",
+		curr.accu.tun_rx_byte, (IINT64)(curr.accu.tun_rx_byte - last.accu.tun_rx_byte),
+		curr.accu.tun_tx_byte, (IINT64)(curr.accu.tun_tx_byte - last.accu.tun_tx_byte));
+	printf("    udp bytes rx=%llu (%lld), tx=%llu (%lld)\n",
+		curr.accu.udp_rx_byte, (IINT64)(curr.accu.udp_rx_byte - last.accu.udp_rx_byte),
+		curr.accu.udp_tx_byte, (IINT64)(curr.accu.udp_tx_byte - last.accu.udp_tx_byte));
 	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CHECKPOINT_INTERVAL/1000);
 }
 
@@ -290,7 +301,6 @@ static int udp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
 	(void)kcp;
 	struct route_context *ctx = (struct route_context *)user;
 	sock_send_packet(ctx->sock, (char *)buf, len, &ctx->next_hop);
-	++curr.accu.udp_tx_pkt;
 	return 0;
 }
 
@@ -510,6 +520,9 @@ static ssize_t tun_recv_packet(int tun, char *buf, size_t buflen) {
 		return -1;
 	}
 
+	curr.accu.tun_rx_pkt  += 1;
+	curr.accu.tun_rx_byte += nread;
+
 	return nread;
 }
 
@@ -526,6 +539,9 @@ static ssize_t sock_recv_packet(int sock, char *buf, size_t buflen) {
 		return -1;
 	}
 
+	curr.accu.udp_rx_pkt  += 1;
+	curr.accu.udp_rx_byte += nread;
+
 	return nread;
 }
 
@@ -540,6 +556,9 @@ static void sock_send_packet(int sock, char *pkt, size_t pktlen, struct sockaddr
 			log_error("Was only able to send %d out of %d bytes to %s:%hu\n",
 					(int)nsent, (int)pktlen, inet_ntoa(dst->sin_addr), ntohs(dst->sin_port));
 		}
+	} else {
+		curr.accu.udp_tx_pkt  += 1;
+		curr.accu.udp_tx_byte += nsent;
 	}
 }
 
@@ -557,6 +576,9 @@ _retry:
 		} else {
 			log_error("Was only able to send %d out of %d bytes to TUN\n", (int)nsent, (int)pktlen);
 		}
+	} else {
+		curr.accu.tun_tx_pkt  += 1;
+		curr.accu.tun_tx_byte += nsent;
 	}
 }
 
@@ -796,7 +818,6 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 		IUINT32 index = pop_front_queue();
 		char *p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
-		++curr.accu.tun_tx_pkt;
 	}
 
 	push_back_queue(current + DELAY_MILLIS, pkt, pktlen);
@@ -827,7 +848,6 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 		index = pop_front_queue();
 		p = queue + index * tcp_pkt_len;
 		tun_send_packet(tun, (char *) &(((tcp_pkt *) p)->iph), ((tcp_pkt *) p)->len);
-		++curr.accu.tun_tx_pkt;
 		--n;
 	}
 }
@@ -931,18 +951,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		if( fds[PFD_TUN].revents & POLLIN || fds[PFD_SOCK].revents & POLLIN ) {
 			counter = 0;
 			do {
-				int r;
 				++counter;
 				activity = 0;
-				r = tun_to_kcp(tun, buf, tun_mtu);
-				activity += r;
-				if (r) ++curr.accu.tun_rx_pkt;
-				r = udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
-				activity += r;
-				if (r) ++curr.accu.udp_rx_pkt;
-				//r = udp_to_queue(sock, tun, buf, tun_mtu, now);
-				//activity += r;
-				//if (r) ++rx;
+				activity += tun_to_kcp(tun, buf, tun_mtu);
+				activity += udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
 
 				/* As long as tun or udp is readable bypass poll().
 				 * We'll just occasionally get EAGAIN on an unreadable fd which
@@ -952,7 +964,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				 * This is at the expense of the ctl socket, a counter could be
 				 * used to place an upper bound on how long we may neglect ctl.
 				 */
-				if (counter == 100)  /* 50MB/s ~ 350pkt/10ms */
+				if (counter == 100)
 					break;
 			} while( activity );
 		}
