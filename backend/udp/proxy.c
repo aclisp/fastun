@@ -204,15 +204,22 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 }
 
 static void print_stat() {
-	log_info("high_watermark: processing_cost=%d(%d) queueing_batch_tun_send=%d(%d) queueing_max_total=%d(%d)\n",
+	if (((IINT64)(curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt)) == 0)
+		return;
+
+	printf("-------------\n");
+	printf("HIGHWATERMARK\n");
+	printf("    proc_cost=%d (%d) tun_sb=%d (%d) que_len=%d (%d)\n",
 		curr.mark.processing_cost, curr.mark.processing_cost - last.mark.processing_cost,
 		curr.mark.queueing_batch_tun_send, curr.mark.queueing_batch_tun_send - last.mark.queueing_batch_tun_send,
 		curr.mark.queueing_max_total, curr.mark.queueing_max_total - last.mark.queueing_max_total);
-	log_info("accumulation: tun rx=%llu(%llu), tx=%llu(%llu); udp rx=%llu(%llu), tx=%llu(%llu)\n",
-		curr.accu.tun_rx_pkt, curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt,
-		curr.accu.tun_tx_pkt, curr.accu.tun_tx_pkt - last.accu.tun_tx_pkt,
-		curr.accu.udp_rx_pkt, curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt,
-		curr.accu.udp_tx_pkt, curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt);
+	printf("ACCUMULATIONS\n");
+	printf("    tun rx=%llu (%lld), tx=%llu (%lld)\n",
+		curr.accu.tun_rx_pkt, (IINT64)(curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt),
+		curr.accu.tun_tx_pkt, (IINT64)(curr.accu.tun_tx_pkt - last.accu.tun_tx_pkt));
+	printf("    udp rx=%llu (%lld), tx=%llu (%lld)\n",
+		curr.accu.udp_rx_pkt, (IINT64)(curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt),
+		curr.accu.udp_tx_pkt, (IINT64)(curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt));
 }
 
 static void send_net_unreachable(int tun, char *offender) {
