@@ -233,6 +233,9 @@ static void print_stat() {
 	printf("    udp bytes rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.udp_rx_byte, (IINT64)(curr.accu.udp_rx_byte - last.accu.udp_rx_byte),
 		curr.accu.udp_tx_byte, (IINT64)(curr.accu.udp_tx_byte - last.accu.udp_tx_byte));
+	printf("OVERHEAD\n");
+	printf("    tx app->tun->?->udp: %f%%\n", curr.accu.udp_tx_byte * 100.0 / curr.accu.tun_rx_byte);
+	printf("    rx app<-tun<-?<-udp: %f%%\n", curr.accu.udp_rx_byte * 100.0 / curr.accu.tun_tx_byte);
 	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CHECKPOINT_INTERVAL/1000);
 }
 
