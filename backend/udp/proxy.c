@@ -28,7 +28,7 @@
 #define IKCP_RCVWND 10000
 #define DELAY_QUESIZ 10000
 #define DELAY_MILLIS 30
-#define CHECKPOINT_INTERVAL 10000
+#define CP_INTERVAL 10000
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -69,10 +69,15 @@ typedef struct icmp_pkt {
 typedef uint32_t __attribute__((__may_alias__)) aliasing_uint32_t;
 
 /* statistics */
-struct high_watermark {
-	int processing_cost;  /* If this too high, it could be I/O block */
-	int queueing_batch_tun_send;  /* This one should be smaller than max total */
-	int queueing_max_total;  /* If this too high, increase DELAY_QUESIZ */
+struct snapshot {
+	int proc_cost;     /* If this is too high, it could be I/O block */
+	int queue_batch;   /* This one should be smaller than queue_len */
+	int queue_len;     /* If this is too high, increase DELAY_QUESIZ */
+	int kcp_nsnd_buf;  /* send buffer is where units are stored on ikcp_flush */
+	int kcp_nsnd_que;  /* send queue is where units are stored on ikcp_send */
+	int kcp_nrcv_buf;  /* recv buffer is where units are stored on ikcp_input */
+	int kcp_nrcv_que;  /* recv queue is where units are stored on ikcp_recv */
+	int kcp_ackcount;
 };
 
 struct accumulation {
@@ -88,7 +93,8 @@ struct accumulation {
 };
 
 typedef struct statistics {
-	struct high_watermark mark;
+	struct snapshot mark;
+	struct snapshot used;
 	struct accumulation accu;
 } statistics;
 
@@ -208,6 +214,20 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 	return ~t1;
 }
 
+static void print_param(ikcpcb *kcp) {
+	char buf[24];
+
+	printf("PARAMETERS\n");
+	printf("    extra header (besides UDP/IP) %d bytes\n", IKCP_OVERHEAD);
+	printf("    send window %d units\n", IKCP_SNDWND);
+	printf("    recv window %d units\n", IKCP_RCVWND);
+	printf("    delay queue size %d units\n", DELAY_QUESIZ);
+	printf("    delay %d milliseconds before deliver to tun\n", DELAY_MILLIS);
+	printf("    nodelay:%d interval:%d fastresend:%d nocwnd:%d rx_minrto:%d\n",
+		kcp->nodelay, kcp->interval, kcp->fastresend, kcp->nocwnd, kcp->rx_minrto);
+	printf("Time is %s.\n\n", timestamp(buf));
+}
+
 static void print_stat() {
 	char buf[24];
 
@@ -215,28 +235,42 @@ static void print_stat() {
 		return;
 
 	printf("-------------\n");
+	printf("CURRENT USAGE\n");
+	printf("    proc_cost=%d tun_txb=%d que_len=%d\n",
+		curr.used.proc_cost, curr.used.queue_batch, curr.used.queue_len);
+	printf("    nsnd_buf=%d nsnd_que=%d ackcount=%d\n",
+		curr.used.kcp_nsnd_buf, curr.used.kcp_nsnd_que, curr.used.kcp_ackcount);
+	printf("    nrcv_buf=%d nrcv_que=%d\n",
+		curr.used.kcp_nrcv_buf, curr.used.kcp_nrcv_que);
 	printf("HIGHWATERMARK\n");
-	printf("    proc_cost=%d (%d) tun_sb=%d (%d) que_len=%d (%d)\n",
-		curr.mark.processing_cost, curr.mark.processing_cost - last.mark.processing_cost,
-		curr.mark.queueing_batch_tun_send, curr.mark.queueing_batch_tun_send - last.mark.queueing_batch_tun_send,
-		curr.mark.queueing_max_total, curr.mark.queueing_max_total - last.mark.queueing_max_total);
+	printf("    proc_cost=%d (%d) tun_txb=%d (%d) que_len=%d (%d)\n",
+		curr.mark.proc_cost,    curr.mark.proc_cost    - last.mark.proc_cost,
+		curr.mark.queue_batch,  curr.mark.queue_batch  - last.mark.queue_batch,
+		curr.mark.queue_len,    curr.mark.queue_len    - last.mark.queue_len);
+	printf("    nsnd_buf=%d (%d) nsnd_que=%d (%d) ackcount=%d (%d)\n",
+		curr.mark.kcp_nsnd_buf, curr.mark.kcp_nsnd_buf - last.mark.kcp_nsnd_buf,
+		curr.mark.kcp_nsnd_que, curr.mark.kcp_nsnd_que - last.mark.kcp_nsnd_que,
+		curr.mark.kcp_ackcount, curr.mark.kcp_ackcount - last.mark.kcp_ackcount);
+	printf("    nrcv_buf=%d (%d) nrcv_que=%d (%d)\n",
+		curr.mark.kcp_nrcv_buf, curr.mark.kcp_nrcv_buf - last.mark.kcp_nrcv_buf,
+		curr.mark.kcp_nrcv_que, curr.mark.kcp_nrcv_que - last.mark.kcp_nrcv_que);
 	printf("ACCUMULATIONS\n");
 	printf("    tun pkets rx=%llu (%lld), tx=%llu (%lld)\n",
-		curr.accu.tun_rx_pkt, (IINT64)(curr.accu.tun_rx_pkt - last.accu.tun_rx_pkt),
-		curr.accu.tun_tx_pkt, (IINT64)(curr.accu.tun_tx_pkt - last.accu.tun_tx_pkt));
+		curr.accu.tun_rx_pkt,  (IINT64)(curr.accu.tun_rx_pkt  - last.accu.tun_rx_pkt),
+		curr.accu.tun_tx_pkt,  (IINT64)(curr.accu.tun_tx_pkt  - last.accu.tun_tx_pkt));
 	printf("    udp pkets rx=%llu (%lld), tx=%llu (%lld)\n",
-		curr.accu.udp_rx_pkt, (IINT64)(curr.accu.udp_rx_pkt - last.accu.udp_rx_pkt),
-		curr.accu.udp_tx_pkt, (IINT64)(curr.accu.udp_tx_pkt - last.accu.udp_tx_pkt));
+		curr.accu.udp_rx_pkt,  (IINT64)(curr.accu.udp_rx_pkt  - last.accu.udp_rx_pkt),
+		curr.accu.udp_tx_pkt,  (IINT64)(curr.accu.udp_tx_pkt  - last.accu.udp_tx_pkt));
 	printf("    tun bytes rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.tun_rx_byte, (IINT64)(curr.accu.tun_rx_byte - last.accu.tun_rx_byte),
 		curr.accu.tun_tx_byte, (IINT64)(curr.accu.tun_tx_byte - last.accu.tun_tx_byte));
 	printf("    udp bytes rx=%llu (%lld), tx=%llu (%lld)\n",
 		curr.accu.udp_rx_byte, (IINT64)(curr.accu.udp_rx_byte - last.accu.udp_rx_byte),
 		curr.accu.udp_tx_byte, (IINT64)(curr.accu.udp_tx_byte - last.accu.udp_tx_byte));
-	printf("OVERHEAD\n");
+	printf("BAND OVERHEAD\n");
 	printf("    tx app->tun->?->udp: %f%%\n", curr.accu.udp_tx_byte * 100.0 / curr.accu.tun_rx_byte);
 	printf("    rx app<-tun<-?<-udp: %f%%\n", curr.accu.udp_rx_byte * 100.0 / curr.accu.tun_tx_byte);
-	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CHECKPOINT_INTERVAL/1000);
+	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CP_INTERVAL/1000);
 }
 
 static void send_net_unreachable(int tun, char *offender) {
@@ -343,6 +377,9 @@ static int kcp_alloc(struct ip_net dst, struct sockaddr_in *next_hop, int sock,
 	}
 	//kcp->rx_minrto = 10;
 	//kcp->fastresend = 1;
+
+	if (routes_cnt == 0)
+		print_param(kcp);
 
 	*pctx = ctx;
 	*pkcp = kcp;
@@ -833,7 +870,7 @@ static inline int _itimediff(IUINT32 later, IUINT32 earlier)
 	return ((IINT32)(later - earlier));
 }
 
-static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
+static void process_queue(int tun, IUINT32 current) {
 	/* iterate queue from front, send the overdue packets to tun.
 		other packets still hold in queue. */
 	char *p;
@@ -844,8 +881,15 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 		if (_itimediff(((tcp_pkt *) p)->sendts, current) > 0)
 			break;
 	}
-	*proc = n;
-	*total = qlen;
+
+	/* update statistics */
+	curr.used.queue_batch = n;
+	if (curr.used.queue_batch > curr.mark.queue_batch)
+		curr.mark.queue_batch = curr.used.queue_batch;
+	curr.used.queue_len = qlen;
+	if (curr.used.queue_len > curr.mark.queue_len)
+		curr.mark.queue_len = curr.used.queue_len;
+
 	/* now we have n packets to send */
 	while (n) {
 		index = pop_front_queue();
@@ -858,14 +902,39 @@ static void process_queue(int tun, IUINT32 current, int *proc, int *total) {
 static void process_kcp(int tun, IUINT32 current, char *buf, size_t buflen) {
 	size_t i;
 	int pktlen;
-
+	ikcpcb *kcp;
+	/* update statistics */
 	for( i = 0; i < routes_cnt; i++ ) {
-		ikcp_update(routes[i].kcp, current);
+		if (i > 0) break;
+		kcp = routes[i].kcp;
+		curr.used.kcp_nsnd_buf = kcp->nsnd_buf;
+		if (curr.used.kcp_nsnd_buf > curr.mark.kcp_nsnd_buf)
+			curr.mark.kcp_nsnd_buf = curr.used.kcp_nsnd_buf;
+		curr.used.kcp_nsnd_que = kcp->nsnd_que;
+		if (curr.used.kcp_nsnd_que > curr.mark.kcp_nsnd_que)
+			curr.mark.kcp_nsnd_que = curr.used.kcp_nsnd_que;
+		curr.used.kcp_nrcv_buf = kcp->nrcv_buf;
+		if (curr.used.kcp_nrcv_buf > curr.mark.kcp_nrcv_buf)
+			curr.mark.kcp_nrcv_buf = curr.used.kcp_nrcv_buf;
+		curr.used.kcp_nrcv_que = kcp->nrcv_que;
+		if (curr.used.kcp_nrcv_que > curr.mark.kcp_nrcv_que)
+			curr.mark.kcp_nrcv_que = curr.used.kcp_nrcv_que;
+		curr.used.kcp_ackcount = kcp->ackcount;
+		if (curr.used.kcp_ackcount > curr.mark.kcp_ackcount)
+			curr.mark.kcp_ackcount = curr.used.kcp_ackcount;
 	}
 
+	/* update and flush */
 	for( i = 0; i < routes_cnt; i++ ) {
+		kcp = routes[i].kcp;
+		ikcp_update(kcp, current);
+	}
+
+	/* recv until EAGAIN */
+	for( i = 0; i < routes_cnt; i++ ) {
+		kcp = routes[i].kcp;
 		while (1) {
-			pktlen = ikcp_recv(routes[i].kcp, buf, buflen);
+			pktlen = ikcp_recv(kcp, buf, buflen);
 			if (pktlen < 0) break;
 			en_queue(tun, buf, pktlen, current);
 		}
@@ -914,10 +983,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
-	int cost = 0;
-	int proc = 0;
-	int total = 0;
-	int interval = 10, timeout;
+	int cost = 0, interval = 10, timeout;
 	IUINT32 now, checkpoint = 0;
 
 	while( !exit_flag ) {
@@ -942,11 +1008,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 		process_kcp(tun, now, buf, tun_mtu);
 
-		process_queue(tun, now, &proc, &total);
-		if (proc > curr.mark.queueing_batch_tun_send)
-			curr.mark.queueing_batch_tun_send = proc;
-		if (total > curr.mark.queueing_max_total)
-			curr.mark.queueing_max_total = total;
+		process_queue(tun, now);
 
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl, sock);
@@ -973,9 +1035,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 
 		cost = _itimediff(current_time_millis(), now);
-		if (cost > curr.mark.processing_cost)
-			curr.mark.processing_cost = cost;
-		if (checkpoint == 0 || _itimediff(now, checkpoint) >= CHECKPOINT_INTERVAL) {
+		curr.used.proc_cost = cost;
+		if (curr.used.proc_cost > curr.mark.proc_cost)
+			curr.mark.proc_cost = curr.used.proc_cost;
+		if (checkpoint == 0 || _itimediff(now, checkpoint) >= CP_INTERVAL) {
 			print_stat();
 			last = curr;
 			checkpoint = now;
