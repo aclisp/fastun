@@ -115,6 +115,12 @@ size_t tun_mtu_;
 int log_enabled;
 int exit_flag;
 
+#define SNAPSHOT_SET(field, value) do {    \
+	curr.used.field = value;               \
+	if (curr.used.field > curr.mark.field) \
+		curr.mark.field = curr.used.field; \
+	} while (0)
+
 static inline in_addr_t netmask(int prefix_len) {
 	return htonl(~((uint32_t)0) << (32 - prefix_len));
 }
@@ -237,7 +243,7 @@ static void print_stat() {
 	printf("-------------\n");
 	printf("CURRENT USAGE\n");
 	printf("    proc_cost=%d tun_txb=%d que_len=%d\n",
-		curr.used.proc_cost, curr.used.queue_batch, curr.used.queue_len);
+		curr.used.proc_cost,    curr.used.queue_batch,  curr.used.queue_len);
 	printf("    nsnd_buf=%d nsnd_que=%d ackcount=%d\n",
 		curr.used.kcp_nsnd_buf, curr.used.kcp_nsnd_que, curr.used.kcp_ackcount);
 	printf("    nrcv_buf=%d nrcv_que=%d\n",
@@ -883,12 +889,8 @@ static void process_queue(int tun, IUINT32 current) {
 	}
 
 	/* update statistics */
-	curr.used.queue_batch = n;
-	if (curr.used.queue_batch > curr.mark.queue_batch)
-		curr.mark.queue_batch = curr.used.queue_batch;
-	curr.used.queue_len = qlen;
-	if (curr.used.queue_len > curr.mark.queue_len)
-		curr.mark.queue_len = curr.used.queue_len;
+	SNAPSHOT_SET(queue_batch, n);
+	SNAPSHOT_SET(queue_len, qlen);
 
 	/* now we have n packets to send */
 	while (n) {
@@ -907,21 +909,11 @@ static void process_kcp(int tun, IUINT32 current, char *buf, size_t buflen) {
 	for( i = 0; i < routes_cnt; i++ ) {
 		if (i > 0) break;
 		kcp = routes[i].kcp;
-		curr.used.kcp_nsnd_buf = kcp->nsnd_buf;
-		if (curr.used.kcp_nsnd_buf > curr.mark.kcp_nsnd_buf)
-			curr.mark.kcp_nsnd_buf = curr.used.kcp_nsnd_buf;
-		curr.used.kcp_nsnd_que = kcp->nsnd_que;
-		if (curr.used.kcp_nsnd_que > curr.mark.kcp_nsnd_que)
-			curr.mark.kcp_nsnd_que = curr.used.kcp_nsnd_que;
-		curr.used.kcp_nrcv_buf = kcp->nrcv_buf;
-		if (curr.used.kcp_nrcv_buf > curr.mark.kcp_nrcv_buf)
-			curr.mark.kcp_nrcv_buf = curr.used.kcp_nrcv_buf;
-		curr.used.kcp_nrcv_que = kcp->nrcv_que;
-		if (curr.used.kcp_nrcv_que > curr.mark.kcp_nrcv_que)
-			curr.mark.kcp_nrcv_que = curr.used.kcp_nrcv_que;
-		curr.used.kcp_ackcount = kcp->ackcount;
-		if (curr.used.kcp_ackcount > curr.mark.kcp_ackcount)
-			curr.mark.kcp_ackcount = curr.used.kcp_ackcount;
+		SNAPSHOT_SET(kcp_nsnd_buf, kcp->nsnd_buf);
+		SNAPSHOT_SET(kcp_nsnd_que, kcp->nsnd_que);
+		SNAPSHOT_SET(kcp_nrcv_buf, kcp->nrcv_buf);
+		SNAPSHOT_SET(kcp_nrcv_que, kcp->nrcv_que);
+		SNAPSHOT_SET(kcp_ackcount, kcp->ackcount);
 	}
 
 	/* update and flush */
@@ -1035,9 +1027,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 
 		cost = _itimediff(current_time_millis(), now);
-		curr.used.proc_cost = cost;
-		if (curr.used.proc_cost > curr.mark.proc_cost)
-			curr.mark.proc_cost = curr.used.proc_cost;
+		SNAPSHOT_SET(proc_cost, cost);
 		if (checkpoint == 0 || _itimediff(now, checkpoint) >= CP_INTERVAL) {
 			print_stat();
 			last = curr;
