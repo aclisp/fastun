@@ -266,8 +266,8 @@ static void print_stat() {
 		curr.valu.kcp_rmte_wnd, curr.valu.kcp_cwnd,     curr.valu.kcp_ssthresh);
 	printf("    rx_rto=%d rx_rttval=%d rx_srtt=%d\n",
 		curr.valu.kcp_rx_rto,   curr.valu.kcp_rx_rttval,curr.valu.kcp_rx_srtt);
-	printf("    xmit=%d\n",
-		curr.valu.kcp_xmit);
+	printf("    xmit=%d (%d)\n",
+		curr.valu.kcp_xmit,     curr.valu.kcp_xmit     - last.valu.kcp_xmit);
 
 	printf("LOW WATERMARK\n");
 	printf("    rmte_wnd=%d\n",
@@ -1019,7 +1019,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	while( !exit_flag ) {
 		/* poll exactly every interval ms */
 		if (cost >= interval) {
-			log_info("cost %d ms!\n", cost);
+			//log_info("cost %d ms!\n", cost);
 			cost = cost % interval;
 		}
 		timeout = interval - cost;
