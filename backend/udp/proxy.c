@@ -245,13 +245,19 @@ static void print_param(ikcpcb *kcp) {
 	char buf[24];
 
 	printf("PARAMETERS\n");
-	printf("    extra header (besides UDP/IP) %d bytes\n", IKCP_OVERHEAD);
-	printf("    send window %d units\n", IKCP_SNDWND);
-	printf("    recv window %d units\n", IKCP_RCVWND);
-	printf("    delay queue size %d units\n", DELAY_QUESIZ);
-	printf("    delay %d milliseconds before deliver to tun\n", DELAY_MILLIS);
-	printf("    nodelay:%d interval:%d fastresend:%d nocwnd:%d rx_minrto:%d\n",
-		kcp->nodelay, kcp->interval, kcp->fastresend, kcp->nocwnd, kcp->rx_minrto);
+	printf("    delay queue %s\n", SKIP_QUE?"disabled":"enabled");
+	printf("    simplified transmission control (STC) %s\n", SKIP_KCP?"disabled":"enabled");
+	if (!SKIP_KCP) {
+		printf("    STC extra header (besides UDP/IP) %d bytes\n", IKCP_OVERHEAD);
+		printf("    send window %d units\n", IKCP_SNDWND);
+		printf("    recv window %d units\n", IKCP_RCVWND);
+		printf("    nodelay:%d interval:%d fastresend:%d nocwnd:%d rx_minrto:%d\n",
+			kcp->nodelay, kcp->interval, kcp->fastresend, kcp->nocwnd, kcp->rx_minrto);
+	}
+	if (!SKIP_QUE) {
+		printf("    delay queue size %d units\n", DELAY_QUESIZ);
+		printf("    delay %d milliseconds before deliver to tun\n", DELAY_MILLIS);
+	}
 	printf("Time is %s.\n\n", timestamp(buf));
 }
 
