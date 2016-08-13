@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -70,7 +71,17 @@ func newSubnetManager() (subnet.Manager, error) {
 	return subnet.NewLocalManager(cfg)
 }
 
+func RestrictToSingleInstance() {
+	_, err := net.Listen("tcp", "127.0.0.1:61234")
+	if err != nil {
+		panic(err)
+	}
+}
+
 func main() {
+	// Prevent unnecessary subnet update, which could reset KCP on the wire
+	RestrictToSingleInstance()
+
 	// glog will log to tmp files by default. override so all entries
 	// can flow into journald (if running under systemd)
 	flag.Set("logtostderr", "true")
@@ -89,7 +100,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	flagutil.SetFlagsFromEnv(flag.CommandLine, "FLANNELD")
+	flagutil.SetFlagsFromEnv(flag.CommandLine, "TUNNELD")
 
 	sm, err := newSubnetManager()
 	if err != nil {

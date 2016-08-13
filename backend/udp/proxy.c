@@ -24,13 +24,14 @@
 #include "util.h"
 
 #define IKCP_OVERHEAD 24
-#define IKCP_SNDWND 10000
-#define IKCP_RCVWND 10000
-#define DELAY_QUESIZ 10000
-#define DELAY_MILLIS 30
-#define CP_INTERVAL 10000
-#define SKIP_KCP 0
-#define SKIP_QUE 0
+
+int IKCP_SNDWND  = 10000;
+int IKCP_RCVWND  = 10000;
+int DELAY_QUESIZ = 10000;
+int DELAY_MILLIS = 30;
+int CP_INTERVAL  = 10000;
+int SKIP_KCP     = 0;
+int SKIP_QUE     = 0;
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -239,6 +240,18 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 		t1++;
 
 	return ~t1;
+}
+
+static void init_param() {
+	char *p;
+
+	if ((p = getenv("TUNNELD_STC_SNDWND"))   != NULL) IKCP_SNDWND  = atoi(p);
+	if ((p = getenv("TUNNELD_STC_RCVWND"))   != NULL) IKCP_RCVWND  = atoi(p);
+	if ((p = getenv("TUNNELD_DELAY_QUESIZ")) != NULL) DELAY_QUESIZ = atoi(p);
+	if ((p = getenv("TUNNELD_DELAY_MILLIS")) != NULL) DELAY_MILLIS = atoi(p);
+	if ((p = getenv("TUNNELD_CP_INTERVAL"))  != NULL) CP_INTERVAL  = atoi(p);
+	if ((p = getenv("TUNNELD_SKIP_STC"))     != NULL) SKIP_KCP     = atoi(p);
+	if ((p = getenv("TUNNELD_SKIP_QUE"))     != NULL) SKIP_QUE     = atoi(p);
 }
 
 static void print_param(ikcpcb *kcp) {
@@ -1057,6 +1070,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		exit(1);
 	}
 
+	init_param();
 	init_stat();
 	init_queue(tun_mtu);
 
