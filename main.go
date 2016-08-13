@@ -71,7 +71,7 @@ func newSubnetManager() (subnet.Manager, error) {
 	return subnet.NewLocalManager(cfg)
 }
 
-func RestrictToSingleInstance() {
+func restrictToSingleInstance() {
 	_, err := net.Listen("tcp", "127.0.0.1:61234")
 	if err != nil {
 		panic(err)
@@ -80,7 +80,7 @@ func RestrictToSingleInstance() {
 
 func main() {
 	// Prevent unnecessary subnet update, which could reset KCP on the wire
-	RestrictToSingleInstance()
+	restrictToSingleInstance()
 
 	// glog will log to tmp files by default. override so all entries
 	// can flow into journald (if running under systemd)
