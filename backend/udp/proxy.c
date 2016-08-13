@@ -71,8 +71,13 @@ typedef uint32_t __attribute__((__may_alias__)) aliasing_uint32_t;
 /* statistics */
 struct stat_gauge {
 	int proc_cost;     /* If this is too high, it could be I/O block */
+	int proc_cost_k;   /* cost on process_kcp */
+	int proc_cost_q;   /* cost on process_queue */
+	int proc_cost_d;   /* cost on process data */
 	int queue_batch;   /* This one should be smaller than queue_len */
 	int queue_len;     /* If this is too high, increase DELAY_QUESIZ */
+	int udp_nsnd_buf;
+	int udp_nrcv_buf;
 	int kcp_nsnd_buf;  /* send buffer is where units are stored on ikcp_flush */
 	int kcp_nsnd_que;  /* send queue is where units are stored on ikcp_send */
 	int kcp_nrcv_buf;  /* recv buffer is where units are stored on ikcp_input */
@@ -258,6 +263,8 @@ static void print_stat() {
 	printf("CURRENT VALUE\n");
 	printf("    proc_cost=%d tun_txb=%d que_len=%d\n",
 		curr.valu.proc_cost,    curr.valu.queue_batch,  curr.valu.queue_len);
+	printf("    cost_k=%d cost_q=%d cost_d=%d\n",
+		curr.valu.proc_cost_k,  curr.valu.proc_cost_q,  curr.valu.proc_cost_d);
 	printf("    nsnd_buf=%d nsnd_que=%d ackcount=%d\n",
 		curr.valu.kcp_nsnd_buf, curr.valu.kcp_nsnd_que, curr.valu.kcp_ackcount);
 	printf("    nrcv_buf=%d nrcv_que=%d\n",
@@ -268,6 +275,8 @@ static void print_stat() {
 		curr.valu.kcp_rx_rto,   curr.valu.kcp_rx_rttval,curr.valu.kcp_rx_srtt);
 	printf("    xmit=%d (%d)\n",
 		curr.valu.kcp_xmit,     curr.valu.kcp_xmit     - last.valu.kcp_xmit);
+	printf("    udp_nsnd_buf=%d udp_nrcv_buf=%d\n",
+		curr.valu.udp_nsnd_buf, curr.valu.udp_nrcv_buf);
 
 	printf("LOW WATERMARK\n");
 	printf("    rmte_wnd=%d\n",
@@ -278,6 +287,10 @@ static void print_stat() {
 		curr.mark.proc_cost,    curr.mark.proc_cost    - last.mark.proc_cost,
 		curr.mark.queue_batch,  curr.mark.queue_batch  - last.mark.queue_batch,
 		curr.mark.queue_len,    curr.mark.queue_len    - last.mark.queue_len);
+	printf("    cost_k=%d (%d) cost_q=%d (%d) cost_d=%d (%d)\n",
+		curr.mark.proc_cost_k,  curr.mark.proc_cost_k  - last.mark.proc_cost_k,
+		curr.mark.proc_cost_q,  curr.mark.proc_cost_q  - last.mark.proc_cost_q,
+		curr.mark.proc_cost_d,  curr.mark.proc_cost_d  - last.mark.proc_cost_d);
 	printf("    nsnd_buf=%d (%d) nsnd_que=%d (%d) ackcount=%d (%d)\n",
 		curr.mark.kcp_nsnd_buf, curr.mark.kcp_nsnd_buf - last.mark.kcp_nsnd_buf,
 		curr.mark.kcp_nsnd_que, curr.mark.kcp_nsnd_que - last.mark.kcp_nsnd_que,
@@ -288,6 +301,9 @@ static void print_stat() {
 	printf("    cwnd=%d (%d) ssthresh=%d (%d)\n",
 		curr.mark.kcp_cwnd,     curr.mark.kcp_cwnd     - last.mark.kcp_cwnd,
 		curr.mark.kcp_ssthresh, curr.mark.kcp_ssthresh - last.mark.kcp_ssthresh);
+	printf("    udp_nsnd_buf=%d (%d) udp_nrcv_buf=%d (%d)\n",
+		curr.mark.udp_nsnd_buf, curr.mark.udp_nsnd_buf - last.mark.udp_nsnd_buf,
+		curr.mark.udp_nrcv_buf, curr.mark.udp_nrcv_buf - last.mark.udp_nrcv_buf);
 
 	printf("ACCUMULATIONS\n");
 	printf("    tun pkets rx=%llu (%lld), tx=%llu (%lld)\n",
@@ -906,6 +922,15 @@ static inline int _itimediff(IUINT32 later, IUINT32 earlier)
 	return ((IINT32)(later - earlier));
 }
 
+static void get_udp_stat(int sock) {
+	int size;
+	socklen_t optlen = sizeof(size);
+	if (getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &size, &optlen) == 0)
+		GAUGE_SET(udp_nsnd_buf, size);
+	if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &size, &optlen) == 0)
+		GAUGE_SET(udp_nrcv_buf, size);
+}
+
 static void process_queue(int tun, IUINT32 current) {
 	/* iterate queue from front, send the overdue packets to tun.
 		other packets still hold in queue. */
@@ -1013,8 +1038,10 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
+	int cost_k, cost_q, cost_d;
 	int cost = 0, interval = 10, timeout;
 	IUINT32 now, checkpoint = 0;
+	IUINT32 now0, tmp;
 
 	while( !exit_flag ) {
 		/* poll exactly every interval ms */
@@ -1026,6 +1053,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 		int nfds = poll(fds, PFD_CNT, timeout), activity, counter;
 		now = current_time_millis();
+		now0 = now;
 		if( nfds < 0 ) {
 			if( errno == EINTR ) {
 				cost = 0;
@@ -1037,8 +1065,14 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 
 		process_kcp(tun, now, buf, tun_mtu);
+		tmp = current_time_millis();
+		cost_k = _itimediff(tmp, now);
+		now = tmp;
 
 		process_queue(tun, now);
+		tmp = current_time_millis();
+		cost_q = _itimediff(tmp, now);
+		now = tmp;
 
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl, sock);
@@ -1063,10 +1097,17 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 					break;
 			} while( activity );
 		}
+		tmp = current_time_millis();
+		cost_d = _itimediff(tmp, now);
+		cost = _itimediff(tmp, now0);
 
-		cost = _itimediff(current_time_millis(), now);
 		GAUGE_SET(proc_cost, cost);
+		GAUGE_SET(proc_cost_k, cost_k);
+		GAUGE_SET(proc_cost_q, cost_q);
+		GAUGE_SET(proc_cost_d, cost_d);
+
 		if (checkpoint == 0 || _itimediff(now, checkpoint) >= CP_INTERVAL) {
+			get_udp_stat(sock);
 			print_stat();
 			last = curr;
 			checkpoint = now;
