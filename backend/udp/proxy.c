@@ -29,6 +29,8 @@
 #define DELAY_QUESIZ 10000
 #define DELAY_MILLIS 30
 #define CP_INTERVAL 10000
+#define SKIP_KCP 0
+#define SKIP_QUE 0
 
 /* tcp_pkt is the buf read from tun, we send it to upper layer after sendts. */
 typedef struct tcp_pkt {
@@ -538,7 +540,7 @@ static int del_route(struct ip_net dst) {
 		dst.mask, ip_ntoa(buf2, dst.mask));
 	return ENOENT;
 }
-#if 0
+
 static struct sockaddr_in *find_route(in_addr_t dst) {
 	size_t i;
 
@@ -557,7 +559,7 @@ static struct sockaddr_in *find_route(in_addr_t dst) {
 
 	return NULL;
 }
-#endif
+
 static ikcpcb *find_by_addr(in_addr_t dst) {
 	size_t i;
 
@@ -751,7 +753,7 @@ static int udp_to_kcp(int sock, char *buf, size_t buflen) {
 _active:
 	return 1;
 }
-#if 0
+
 static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 	struct iphdr *iph;
 	struct sockaddr_in *next_hop;
@@ -764,6 +766,10 @@ static int tun_to_udp(int tun, int sock, char *buf, size_t buflen) {
 
 	next_hop = find_route((in_addr_t) iph->daddr);
 	if( !next_hop ) {
+		char saddr[32], daddr[32];
+		log_error("Next hop not found for IP fragment %s -> %s, kick back net unreachable\n",
+				inaddr_str(iph->saddr, saddr, sizeof(saddr)),
+				inaddr_str(iph->daddr, daddr, sizeof(daddr)));
 		send_net_unreachable(tun, buf);
 		goto _active;
 	}
@@ -800,7 +806,7 @@ static int udp_to_tun(int sock, int tun, char *buf, size_t buflen) {
 _active:
 	return 1;
 }
-#endif
+
 static void init_queue(size_t tun_mtu) {
 	qmax = DELAY_QUESIZ;
 	tcp_pkt_len = IOFFSETOF(tcp_pkt, iph) + tun_mtu;
@@ -904,6 +910,11 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 		goto _active;
 	}
 
+	if (SKIP_QUE) {
+		tun_send_packet(tun, pkt, pktlen);
+		goto _active;
+	}
+
 	if (queue_is_full()) {
 		log_info("queue full!\n");
 
@@ -914,6 +925,15 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 
 	push_back_queue(current + DELAY_MILLIS, pkt, pktlen);
 _active:
+	return 1;
+}
+
+static int udp_to_que(int sock, int tun, char *buf, size_t buflen, IUINT32 current) {
+	ssize_t pktlen = sock_recv_packet(sock, buf, buflen);
+	if( pktlen < 0 )
+		return 0;
+
+	en_queue(tun, buf, pktlen, current);
 	return 1;
 }
 
@@ -1038,7 +1058,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
-	int cost_k, cost_q, cost_d;
+	int cost_k = 0, cost_q = 0, cost_d = 0;
 	int cost = 0, interval = 10, timeout;
 	IUINT32 now, checkpoint = 0;
 	IUINT32 now0, tmp;
@@ -1064,15 +1084,19 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			exit(1);
 		}
 
-		process_kcp(tun, now, buf, tun_mtu);
-		tmp = current_time_millis();
-		cost_k = _itimediff(tmp, now);
-		now = tmp;
+		if (!SKIP_KCP) {
+			process_kcp(tun, now, buf, tun_mtu);
+			tmp = current_time_millis();
+			cost_k = _itimediff(tmp, now);
+			now = tmp;
+		}
 
-		process_queue(tun, now);
-		tmp = current_time_millis();
-		cost_q = _itimediff(tmp, now);
-		now = tmp;
+		if (!SKIP_QUE) {
+			process_queue(tun, now);
+			tmp = current_time_millis();
+			cost_q = _itimediff(tmp, now);
+			now = tmp;
+		}
 
 		if( fds[PFD_CTL].revents & POLLIN )
 			process_cmd(ctl, sock);
@@ -1082,8 +1106,16 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			do {
 				++counter;
 				activity = 0;
-				activity += tun_to_kcp(tun, buf, tun_mtu);
-				activity += udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
+				if (SKIP_KCP && SKIP_QUE) {
+					activity += tun_to_udp(tun, sock, buf, tun_mtu);
+					activity += udp_to_tun(sock, tun, buf, tun_mtu);
+				} else if (SKIP_KCP && !SKIP_QUE) {
+					activity += tun_to_udp(tun, sock, buf, tun_mtu);
+					activity += udp_to_que(sock, tun, buf, tun_mtu, now);
+				} else {
+					activity += tun_to_kcp(tun, buf, tun_mtu);
+					activity += udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
+				}
 
 				/* As long as tun or udp is readable bypass poll().
 				 * We'll just occasionally get EAGAIN on an unreadable fd which
