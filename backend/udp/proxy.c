@@ -1151,7 +1151,8 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 		tmp = current_time_millis();
 		cost_d = _itimediff(tmp, now);
-		cost = _itimediff(tmp, now0);
+		now = tmp;
+		cost = _itimediff(now, now0);
 
 		GAUGE_SET(proc_cost, cost);
 		GAUGE_SET(proc_cost_k, cost_k);
@@ -1166,7 +1167,17 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 		}
 	}
 
-	/* TODO before free, cleanup items in the queue! */
+	/* before we quit, cleanup items in kcp and queue */
+	now = current_time_millis();
+	if (!SKIP_KCP) process_kcp(tun, now, buf, tun_mtu);
+	if (!SKIP_QUE) process_queue(tun, now + DELAY_MILLIS*10);
+	assert(queue_is_empty());
+	size_t i;
+	for( i = 0; i < routes_cnt; i++ ) {
+		ikcp_release(routes[i].kcp);
+		free(routes[i].ctx);
+	}
+	free(routes);
 	free(queue);
 	free(buf);
 }
