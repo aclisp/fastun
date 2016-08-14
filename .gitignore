@@ -1,4 +1,7 @@
 .vscode/
 .idea/
+.build/
 a.out
 *.iml
+tunneld_debug
+tunneld_release
