@@ -25,11 +25,13 @@
 
 #define IKCP_OVERHEAD 24
 
+int UDP_SNDBUF   = 10000;
+int UDP_RCVBUF   = 10000;
 int IKCP_SNDWND  = 10000;
 int IKCP_RCVWND  = 10000;
 int DELAY_QUESIZ = 10000;
 int DELAY_MILLIS = 30;
-int CP_INTERVAL  = 10000;
+int CP_INTERVAL  = 900000;
 int SKIP_KCP     = 0;
 int SKIP_QUE     = 0;
 
@@ -245,8 +247,10 @@ static uint16_t cksum(aliasing_uint32_t *buf, int len) {
 static void init_param() {
 	char *p;
 
-	if ((p = getenv("TUNNELD_STC_SNDWND"))   != NULL) IKCP_SNDWND  = atoi(p);
-	if ((p = getenv("TUNNELD_STC_RCVWND"))   != NULL) IKCP_RCVWND  = atoi(p);
+	if ((p = getenv("TUNNELD_UDP_SNDBUF"))   != NULL) UDP_SNDBUF   = atoi(p);
+	if ((p = getenv("TUNNELD_UDP_RCVBUF"))   != NULL) UDP_RCVBUF   = atoi(p);
+	if ((p = getenv("TUNNELD_STC_SNDBUF"))   != NULL) IKCP_SNDWND  = atoi(p);
+	if ((p = getenv("TUNNELD_STC_RCVBUF"))   != NULL) IKCP_RCVWND  = atoi(p);
 	if ((p = getenv("TUNNELD_DELAY_QUESIZ")) != NULL) DELAY_QUESIZ = atoi(p);
 	if ((p = getenv("TUNNELD_DELAY_MILLIS")) != NULL) DELAY_MILLIS = atoi(p);
 	if ((p = getenv("TUNNELD_CP_INTERVAL"))  != NULL) CP_INTERVAL  = atoi(p);
@@ -344,6 +348,20 @@ static void print_stat() {
 	printf("    tx app->tun->?->udp: %f%%\n", curr.accu.udp_tx_byte * 100.0 / curr.accu.tun_rx_byte);
 	printf("    rx app<-tun<-?<-udp: %f%%\n", curr.accu.udp_rx_byte * 100.0 / curr.accu.tun_tx_byte);
 	printf("Time is %s. (val) is increment every %d secs.\n\n", timestamp(buf), CP_INTERVAL/1000);
+}
+
+static void set_socket_buffer_size(int sock, size_t tun_mtu) {
+	/* Payload + KCP header (24 bytes) + UDP header (8 bytes) + IP header (20 bytes) */
+	size_t llmtu = tun_mtu + IKCP_OVERHEAD + 8 + 20;
+	size_t bufsz;
+
+	bufsz = UDP_SNDBUF * llmtu;
+	if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz)) < 0)
+		log_error("failed to set socket send buffer size to %d: %s\n", bufsz, strerror(errno));
+
+	bufsz = UDP_RCVBUF * llmtu;
+	if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)) < 0)
+		log_error("failed to set socket recv buffer size to %d: %s\n", bufsz, strerror(errno));
 }
 
 static void send_net_unreachable(int tun, char *offender) {
@@ -935,7 +953,7 @@ static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current) {
 	}
 
 	if (queue_is_full()) {
-		log_info("queue full!\n");
+		//log_info("queue full!\n");
 
 		IUINT32 index = pop_front_queue();
 		char *p = queue + index * tcp_pkt_len;
@@ -1075,6 +1093,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	init_queue(tun_mtu);
 
 	fcntl(tun, F_SETFL, O_NONBLOCK);
+	set_socket_buffer_size(sock, tun_mtu);
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
