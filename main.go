@@ -15,6 +15,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/aclisp/fastun/network"
+	"github.com/aclisp/fastun/pkg/sysctl"
 	"github.com/aclisp/fastun/remote"
 	"github.com/aclisp/fastun/subnet"
 	"github.com/aclisp/fastun/version"
@@ -101,6 +102,13 @@ func main() {
 	}
 
 	flagutil.SetFlagsFromEnv(flag.CommandLine, "TUNNELD")
+
+	sysctl.SetSysctl(sysctl.NetCoreRmemMax, sysctl.NetCoreRmemMax64M)
+	sysctl.SetSysctl(sysctl.NetCoreWmemMax, sysctl.NetCoreWmemMax64M)
+	sysctl.SetSysctlString(sysctl.NetIpv4TcpMem, sysctl.NetIpv4TcpMem64M)
+	sysctl.SetSysctlString(sysctl.NetIpv4UdpMem, sysctl.NetIpv4UdpMem64M)
+	sysctl.SetSysctlMax(sysctl.NetIpv4TcpRmem, sysctl.NetIpv4TcpRmemMax64M)
+	sysctl.SetSysctlMax(sysctl.NetIpv4TcpWmem, sysctl.NetIpv4TcpWmemMax64M)
 
 	sm, err := newSubnetManager()
 	if err != nil {
