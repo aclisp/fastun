@@ -141,6 +141,9 @@ int exit_flag;
 		curr.mlow.field = curr.valu.field; \
 	} while (0)
 
+static void sock_send_packet(int sock, char *pkt, size_t pktlen, struct sockaddr_in *dst);
+static int en_queue(int tun, char *pkt, int pktlen, IUINT32 current);
+
 static void init_stat() {
 	/* high watermarks init to zero by default. however,
 	 * low watermarks should init to a reasonable value */
@@ -423,8 +426,6 @@ static void send_net_unreachable(int tun, char *offender) {
 	}
 }
 
-static void sock_send_packet(int sock, char *pkt, size_t pktlen, struct sockaddr_in *dst);
-
 static int udp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
 	(void)kcp;
 	struct route_context *ctx = (struct route_context *)user;
@@ -466,7 +467,8 @@ static int kcp_alloc(struct ip_net dst, struct sockaddr_in *next_hop, int sock,
 	if ((err = ikcp_wndsize(kcp, IKCP_SNDWND, IKCP_RCVWND)) < 0) {
 		log_error("failed to set kcp window size: error code is %d\n", err);
 	}
-	//kcp->rx_minrto = 10;
+	kcp->rx_minrto = 5;
+	kcp->interval = 1;
 	//kcp->fastresend = 1;
 
 	if (routes_cnt == 0)
@@ -763,11 +765,12 @@ static int tun_to_kcp(int tun, char *buf, size_t buflen) {
 	if ((err = ikcp_send(kcp, buf, pktlen)) < 0) {
 		log_error("KCP send fail: error code is %d\n", err);
 	}
+	ikcp_flush(kcp);
 _active:
 	return 1;
 }
 
-static int udp_to_kcp(int sock, char *buf, size_t buflen) {
+static int udp_to_kcp(int sock, int tun, char *buf, size_t buflen, IUINT32 current) {
 	int err;
 	IUINT32 conv;
 	ikcpcb *kcp;
@@ -787,6 +790,12 @@ static int udp_to_kcp(int sock, char *buf, size_t buflen) {
 	if ((err = ikcp_input(kcp, buf, pktlen)) < 0) {
 		log_error("KCP input fail: error code is %d\n", err);
 	}
+	while (1) {
+		pktlen = ikcp_recv(kcp, buf, buflen);
+		if (pktlen < 0) break;
+		en_queue(tun, buf, pktlen, current);
+	}
+	ikcp_update(kcp, current);
 _active:
 	return 1;
 }
@@ -1097,20 +1106,12 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 
 	log_info("Proxy start for tunnel addr %8X %s\n", tun_addr, ip_ntoa(buf, tun_addr));
 
-	int cost_k = 0, cost_q = 0, cost_d = 0;
-	int cost = 0, interval = 10, timeout;
+	int cost = 0, cost_k = 0, cost_q = 0, cost_d = 0;
 	IUINT32 now, checkpoint = 0;
 	IUINT32 now0, tmp;
 
 	while( !exit_flag ) {
-		/* poll exactly every interval ms */
-		if (cost >= interval) {
-			//log_info("cost %d ms!\n", cost);
-			cost = cost % interval;
-		}
-		timeout = interval - cost;
-
-		int nfds = poll(fds, PFD_CNT, timeout), activity, counter;
+		int nfds = poll(fds, PFD_CNT, 1), activity, counter;
 		now = current_time_millis();
 		now0 = now;
 		if( nfds < 0 ) {
@@ -1145,15 +1146,17 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 			do {
 				++counter;
 				activity = 0;
+				tmp = current_time_millis();
+
 				if (SKIP_KCP && SKIP_QUE) {
 					activity += tun_to_udp(tun, sock, buf, tun_mtu);
 					activity += udp_to_tun(sock, tun, buf, tun_mtu);
 				} else if (SKIP_KCP && !SKIP_QUE) {
 					activity += tun_to_udp(tun, sock, buf, tun_mtu);
-					activity += udp_to_que(sock, tun, buf, tun_mtu, now);
+					activity += udp_to_que(sock, tun, buf, tun_mtu, tmp);
 				} else {
 					activity += tun_to_kcp(tun, buf, tun_mtu);
-					activity += udp_to_kcp(sock, buf, tun_mtu + IKCP_OVERHEAD);
+					activity += udp_to_kcp(sock, tun, buf, tun_mtu + IKCP_OVERHEAD, tmp);
 				}
 
 				/* As long as tun or udp is readable bypass poll().
@@ -1164,7 +1167,7 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 				 * This is at the expense of the ctl socket, a counter could be
 				 * used to place an upper bound on how long we may neglect ctl.
 				 */
-				if (counter == 100)
+				if (counter == 10)
 					break;
 			} while( activity );
 		}
