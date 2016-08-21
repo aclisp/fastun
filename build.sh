@@ -30,15 +30,15 @@ go build -o $THISDIR/tunneld_debug $PROJECT
 echo "Build the optimized (release) version of tunneld..."
 # build c libs in a subshell
 (
-    CFLAGS="-fPIC -Werror -Winline -Wall -Wextra -std=gnu99 -pedantic-errors -Wno-unused-parameter -DNDEBUG -O2"
+    CFLAGS="-fPIC -Werror -Winline -Wall -Wextra -std=gnu99 -pedantic-errors -Wno-unused-parameter -DNDEBUG -O0 -g"
     cd $GOPATH/lib
     gcc -c $CFLAGS $THISDIR/backend/udp/*.c
-    ar rcs liba.a *.o
+    #ar rcs liba.a *.o
     gcc -shared $CFLAGS -o libtun.so *.o
 )
 mv $THISDIR/backend/udp/*.c $GOPATH/tmp
-export CGO_LDFLAGS="-L$GOPATH/lib -la"
-go build -o $THISDIR/tunneld_release $PROJECT
+#export CGO_LDFLAGS="-L$GOPATH/lib -la"
+#go build -o $THISDIR/tunneld_release $PROJECT
 export CGO_LDFLAGS="-L$GOPATH/lib -ltun"
 go build -o $THISDIR/tunneld_shared  $PROJECT
 mv $GOPATH/tmp/*.c $THISDIR/backend/udp
