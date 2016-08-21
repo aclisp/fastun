@@ -5,3 +5,4 @@ a.out
 *.iml
 tunneld_debug
 tunneld_release
+tunneld_shared
