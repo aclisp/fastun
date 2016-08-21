@@ -764,6 +764,7 @@ static int tun_to_kcp(int tun, char *buf, size_t buflen) {
 
 	if ((err = ikcp_send(kcp, buf, pktlen)) < 0) {
 		log_error("KCP send fail: error code is %d\n", err);
+		goto _active;
 	}
 	ikcp_flush(kcp);
 _active:
@@ -789,6 +790,7 @@ static int udp_to_kcp(int sock, int tun, char *buf, size_t buflen, IUINT32 curre
 
 	if ((err = ikcp_input(kcp, buf, pktlen)) < 0) {
 		log_error("KCP input fail: error code is %d\n", err);
+		goto _active;
 	}
 	while (1) {
 		pktlen = ikcp_recv(kcp, buf, buflen);
